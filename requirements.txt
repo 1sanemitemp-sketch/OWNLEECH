@@ -1,0 +1,6 @@
+pyrofork
+tgcrypto
+aiohttp
+yt-dlp
+psutil
+pillow
