@@ -1,0 +1,21 @@
+# Generic compose file: same file works for every bot repo.
+# VPS:     docker compose up -d --build && docker compose logs -f
+# Railway: ignores this file, builds from Dockerfile + railway.json
+# Container/volume names come from the folder name, so several bots
+# can run side by side on one VPS without conflicts.
+services:
+  bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:
