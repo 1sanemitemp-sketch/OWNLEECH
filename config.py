@@ -36,6 +36,14 @@ DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/downloads")
 SPLIT_SIZE = _int("SPLIT_SIZE", 2097152000)
 ARIA_SECRET = os.environ.get("ARIA_SECRET", "leechsecret")
 
+# Max tasks a normal user can start per day (0 = unlimited). The owner is never limited.
+DAILY_TASK_LIMIT = max(0, _int("DAILY_TASK_LIMIT", 0))
+
+# --- Thumbnails ------------------------------------------------------------
+# Longest side of the HD thumbnail in pixels. Telegram's documented limit is 320; the bigger
+# value gives the HD look. If uploads ever fail with THUMB_INVALID set THUMB_MAX=320.
+THUMB_MAX = max(160, min(_int("THUMB_MAX", 1280), 2000))
+
 # --- Status message -------------------------------------------------------
 STATUS_INTERVAL = max(3, _int("STATUS_INTERVAL", 6))  # seconds between live status edits
 TASKS_PER_PAGE = max(1, _int("TASKS_PER_PAGE", 5))

@@ -23,16 +23,30 @@ The command menu is registered automatically on every start - nothing to set in 
 Leech arguments: `-z` zip, `-e` extract, `-n new name`, `-t thumbnail link`.
 
 ## Settings (`/us`)
-- **Universal**: Leech Destination (PM / Group / PM + Group), Prefix, Suffix, Remove words, Replace pairs
-- **Leech**: Send as Media/Document, Thumbnail, Auto Thumbnail, Leech Caption template, **Caption Font**
-  (Default, Bold, Italic, Underline, Strikethrough, Mono/Code, Spoiler, Preformatted), Screenshots, Leech Splits
-- Direct set: `/us -s font bold`, `/us -s prefix [GRP]`
+- **Universal**: YT-DLP Options, Daily Tasks, Last Bot Used, MediaInfo Mode, User Bot PM (always forced - files
+  from a group always go to the user's bot PM, users cannot change it)
+- **Mirror**: RClone (upload `rclone.conf`; stored only for now)
+- **Leech**: Send As Media/Document, Thumbnail, Leech Split Size, Equal Splits, Prefix, Suffix, Remove, Replace,
+  Caption, Caption Font, **Auto Rename**, Screenshots
+- The **Reset Setting** button only appears after you changed something and asks Yes / No first.
+- Direct set: `/us -s font bold`, `/us -s prefix [GRP]\s`, reply to a photo with `/us -s thumb`
 
-Caption variables: `{filename} {size} {duration} {resolution} {ext}`.
+## Thumbnails (HD)
+Priority: `-t` link (this leech only) > your saved thumbnail > a frame taken from the video itself.
+Thumbnails are kept in HD (`THUMB_MAX`, default 1280 px).
 
-## Groups
-Leech inside a group and the files are delivered to your bot PM (start the bot once). The group gets a
-short "completed" message. Change this in `/us` -> Universal -> Leech Destination.
+## Auto Rename
+Set a format in `/us` -> Leech -> Leech Auto Rename. Placeholders:
+`{name} {year} {season} {episode} {quality} {resolution} {audio} {lib} {ott} {languages} {subtitles}
+{shortlang} {shortsub} {duration} {extension} {raw_name} {file_name} {file_caption}`
+
+- `{name}` never contains site tags like `[Toonworld4all]`.
+- `{resolution}` is plain `720p` / `1080p` (no bit depth).
+- `{shortlang}`: one audio = that language (`Hindi`), two = `Dual`, three or more = `Multi`.
+- Order applied to every file: Auto Rename -> underscores to spaces -> Remove / Replace -> Prefix / Suffix.
+  A name given with `-n` is always used exactly as typed.
+
+Caption variables: `{filename} {size} {duration} {resolution} {ext}` (safe HTML tags like `<b>` are allowed).
 
 ## Deploy on Railway
 1. Push these files to GitHub (files at the repo root).

@@ -10,7 +10,6 @@ import inspect
 import json
 import logging
 import math
-import mimetypes
 import os
 import re
 import secrets
@@ -25,11 +24,13 @@ import yt_dlp
 
 import config as C
 import fastupload
+import rename_utils as R
 import settings as S
 import utils as U
 from compat import (
     BLUE,
     GREEN,
+    KB,
     LIB_LABEL,
     RED,
     B,
@@ -403,6 +404,9 @@ def ytdl_sync(t):
         "merge_output_format": "mp4",
         "retries": 5,
     }
+    opts.update(S.yt_opts(t.uid))
+    opts["progress_hooks"] = [hook]
+    opts["outtmpl"] = f"{t.dir}/%(title).150B.%(ext)s"
     with yt_dlp.YoutubeDL(opts) as y:
         y.download([t.link])
 
@@ -485,18 +489,21 @@ def rename_one(t, f):
     return new
 
 
-def apply_name_rules(files, s):
-    if not any(s[k] for k in ("prefix", "suffix", "remove", "replace")):
-        return files
+async def smart_names(files, s):
+    """Auto rename -> underscores to spaces -> remove / replace -> prefix / suffix."""
     out = []
     for f in files:
         d, n = os.path.split(f)
-        new_name = U.apply_rules(n, s)
-        if new_name != n:
-            new = os.path.join(d, new_name)
-            if not os.path.exists(new):
-                os.rename(f, new)
-                f = new
+        new = n
+        if s["rename"]:
+            new = await R.auto_renamed(s["rename"], n, f)
+        new = U.tidy_name(new)
+        new = U.apply_rules(new, s)
+        if new != n:
+            dst = os.path.join(d, new)
+            if not os.path.exists(dst):
+                os.rename(f, dst)
+                f = dst
         out.append(f)
     return out
 
@@ -505,10 +512,14 @@ def glob_escape(p):
     return re.sub(r"([\[\]\*\?])", r"[\1]", p)
 
 
-async def split_big(path, limit):
-    if os.path.getsize(path) <= limit:
+async def split_big(path, limit, equal=False):
+    size = os.path.getsize(path)
+    if size <= limit:
         return [path]
-    rc, _, err = await run("split", "-b", str(limit), "-d", "--numeric-suffixes=1", "-a", "3", path, path + ".")
+    chunk = limit
+    if equal:  # equal sized parts instead of full parts + one small leftover
+        chunk = math.ceil(size / math.ceil(size / limit))
+    rc, _, err = await run("split", "-b", str(chunk), "-d", "--numeric-suffixes=1", "-a", "3", path, path + ".")
     if rc != 0:
         raise RuntimeError("Split failed: " + err[-200:])
     os.remove(path)
@@ -529,9 +540,12 @@ async def probe(path):
 
 
 async def video_thumb(path, dur, tid):
+    """HD cover frame taken from the middle of the video (longest side C.THUMB_MAX)."""
     out = os.path.join(C.DOWNLOAD_DIR, f"{tid}_th.jpg")
+    m = C.THUMB_MAX
+    vf = f"scale='if(gt(iw,ih),min({m},iw),-2)':'if(gt(iw,ih),-2,min({m},ih))'"
     rc, _, _ = await run(
-        "ffmpeg", "-y", "-ss", str(max(dur // 2, 0)), "-i", path, "-frames:v", "1", "-vf", "scale=320:-1", out
+        "ffmpeg", "-y", "-ss", str(max(dur // 2, 0)), "-i", path, "-frames:v", "1", "-vf", vf, "-q:v", "3", out
     )
     return out if rc == 0 and os.path.exists(out) else None
 
@@ -587,31 +601,90 @@ async def copy_to(sent, chat_id, rk):
         return await sent.copy(chat_id)
 
 
+def with_name(method, name):
+    """Pass the exact file name to Telegram when this library supports it."""
+    try:
+        return {"file_name": name} if "file_name" in inspect.signature(method).parameters else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+TELEGRAPH = {"token": None}
+
+
+async def telegraph_page(title, text):
+    """Publish text on telegra.ph and return the page URL (None on any failure)."""
+    try:
+        if not TELEGRAPH["token"]:
+            tok_file = S.DATA / "telegraph.json"
+            try:
+                TELEGRAPH["token"] = json.loads(tok_file.read_text())["token"]
+            except Exception:  # noqa: BLE001
+                async with SESSION.post(
+                    "https://api.telegra.ph/createAccount", json={"short_name": "MediaInfo", "author_name": "MediaInfo"}
+                ) as r:
+                    TELEGRAPH["token"] = (await r.json())["result"]["access_token"]
+                tok_file.write_text(json.dumps({"token": TELEGRAPH["token"]}))
+        payload = {
+            "access_token": TELEGRAPH["token"],
+            "title": title[:200] or "MediaInfo",
+            "author_name": "MediaInfo",
+            "content": [{"tag": "pre", "children": [text[:50000]]}],
+        }
+        async with SESSION.post("https://api.telegra.ph/createPage", json=payload) as r:
+            data = await r.json()
+        return data["result"]["url"] if data.get("ok") else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("mediainfo page failed: %r", e)
+        return None
+
+
+async def mediainfo_markup(path):
+    """Inline button that opens the MediaInfo page of ``path`` (None when unavailable)."""
+    rc, out, _ = await run("mediainfo", path)
+    if rc != 0 or not out.strip():
+        return None
+    name = os.path.basename(path)
+    link = await telegraph_page(name, out.replace(path, name))
+    return KB([[B("📄 MediaInfo", url=link)]]) if link else None
+
+
 async def send_file(t, f, s, thumb, prog):
     """Upload one file to the first destination, then copy it (instantly) to the others."""
     name = os.path.basename(f)
     size = os.path.getsize(f)
-    mime = mimetypes.guess_type(f)[0] or ""
+    kind = U.media_kind(f)
     primary = t.dests[0]
     in_group = lambda cid: cid == t.chat_id and not t.private  # noqa: E731
     rk = reply_kwargs(t.cmd.id) if in_group(primary) else {}
-    is_video = mime.startswith("video")
+    is_video = kind == "video"
     dur = w = h = 0
-    if is_video or mime.startswith("audio"):
+    if kind in ("video", "audio"):
         dur, w, h = await probe(f)
     caption = U.render_caption(s, name, size, dur, w, h)
     kw = dict(chat_id=primary, caption=caption, progress=prog, **rk)
+    if s["mediainfo"] and kind in ("video", "audio"):
+        markup = await mediainfo_markup(f)
+        if markup:
+            kw["reply_markup"] = markup
 
+    # HD cover: -t link / your thumbnail first, otherwise a frame taken from the video itself
+    cover = thumb or (await video_thumb(f, dur, t.id) if is_video else None)
     if not s["as_doc"] and is_video:
-        th = thumb or (await video_thumb(f, dur, t.id) if s["auto_thumb"] else None)
-        sent = await app.send_video(video=f, duration=dur, width=w, height=h, thumb=th, supports_streaming=True, **kw)
-    elif not s["as_doc"] and mime.startswith("audio"):
-        sent = await app.send_audio(audio=f, duration=dur, thumb=thumb, **kw)
-    elif not s["as_doc"] and mime.startswith("image") and size < 10 * 1024 * 1024:
+        sent = await app.send_video(
+            video=f, duration=dur, width=w, height=h, thumb=cover, supports_streaming=True,
+            **with_name(app.send_video, name), **kw,
+        )
+    elif not s["as_doc"] and kind == "audio":
+        sent = await app.send_audio(
+            audio=f, duration=dur, thumb=thumb, **with_name(app.send_audio, name), **kw
+        )
+    elif not s["as_doc"] and kind == "image" and size < 10 * 1024 * 1024:
         sent = await app.send_photo(photo=f, **kw)
     else:
-        th = thumb or (await video_thumb(f, dur, t.id) if is_video and s["auto_thumb"] else None)
-        sent = await app.send_document(document=f, thumb=th, force_document=True, **kw)
+        sent = await app.send_document(
+            document=f, thumb=cover, force_document=True, **with_name(app.send_document, name), **kw
+        )
 
     delivered = [(name, sent)]
     for extra in t.dests[1:]:
@@ -734,12 +807,12 @@ async def run_task(t):
             elif t.new_name and len(files) == 1:
                 files = [rename_one(t, files[0])]
             if not t.new_name:
-                files = apply_name_rules(files, s)
+                files = await smart_names(files, s)
             t.status = "Split"
             limit = S.split_limit(s)
             final = []
             for f in files:
-                final += await split_big(f, limit)
+                final += await split_big(f, limit, s["equal"])
             t.final_name = os.path.basename(final[0]) if len(final) == 1 else t.name
             delivered = await upload_all(t, final, s)
             await finish_ok(t, final, delivered)
@@ -821,7 +894,7 @@ HELP = (
     "<code>/l https://site.com/movie.mkv</code>\n"
     "<code>/l https://site.com/movie.mkv -n My Movie.mkv -t https://site.com/t.jpg</code>\n"
     "<code>/l https://site.com/a.zip -e</code>\n\n"
-    "<i>Leech inside a group and the files arrive in your bot PM (change it in /us).</i>"
+    "<i>Leech inside a group and the files always arrive in your bot PM.</i>"
 )
 
 USER_COMMANDS = [
@@ -908,13 +981,8 @@ async def notify_pm(m, link):
 
 
 def pick_dests(m, s):
-    if is_private(m):
-        return [m.chat.id]
-    if s["dest"] == "chat":
-        return [m.chat.id]
-    if s["dest"] == "both":
-        return [m.from_user.id, m.chat.id]
-    return [m.from_user.id]
+    """Files always go to the user's bot PM when the command is used in a group (not changeable)."""
+    return [m.chat.id] if is_private(m) else [m.from_user.id]
 
 
 @app.on_message(filters.command(["leech", "l"]))
@@ -932,7 +1000,11 @@ async def leech_cmd(_, m):
     if link.startswith("magnet:") or link.lower().split("?")[0].endswith(".torrent"):
         return await reply(m, "❌ Torrent / magnet links are not supported.")
 
-    s = S.get(m.from_user.id)
+    uid = m.from_user.id
+    if C.DAILY_TASK_LIMIT and uid != C.OWNER_ID and S.daily_used(uid) >= C.DAILY_TASK_LIMIT:
+        return await reply(m, f"❌ Daily task limit reached ({C.DAILY_TASK_LIMIT} per day). Try again tomorrow.")
+
+    s = S.get(uid)
     dests = pick_dests(m, s)
     if not is_private(m) and m.from_user.id in dests and not await notify_pm(m, link):
         rows = [[B("▶️ Start Bot", url=f"https://t.me/{BOT_USERNAME}?start=leech", style=GREEN)]]
@@ -942,6 +1014,7 @@ async def leech_cmd(_, m):
             rows,
         )
 
+    S.bump_daily(uid)
     t = Task(m, link, z, e, name, thumb, dests)
     TASKS[t.id] = t
     spawn(run_task(t))
@@ -1102,6 +1175,19 @@ async def unauth_cmd(_, m):
 
 
 # ------------------------------------------------------------------ handlers: /us settings
+def is_image_msg(m):
+    return bool(m and (m.photo or (m.document and (m.document.mime_type or "").startswith("image"))))
+
+
+async def save_thumb_from(m, uid):
+    raw = await m.download(file_name=str(S.THUMBS / f"{uid}_raw"))
+    try:
+        S.prep_thumb(raw, S.THUMBS / f"{uid}.jpg")
+    finally:
+        if os.path.exists(raw):
+            os.remove(raw)
+
+
 @app.on_message(filters.command(["usetting", "us"]))
 async def usetting_cmd(_, m):
     if not authorized(m):
@@ -1109,15 +1195,39 @@ async def usetting_cmd(_, m):
     if not m.from_user:
         return
     uid = m.from_user.id
-    parts = (m.text or "").split(maxsplit=3)
+    parts = (m.text or m.caption or "").split(maxsplit=3)
     if len(parts) >= 2 and parts[1].lower() in ("-s", "-set"):
         if len(parts) < 3:
             return await reply(m, f"Usage: <code>/us -s key value</code>\nKeys: <code>{S.KEYS_HELP}</code>")
         key = parts[2]
         value = parts[3] if len(parts) > 3 else ""
+        if key.lower() == "thumb":
+            src = m if is_image_msg(m) else m.reply_to_message
+            if is_image_msg(src):
+                await save_thumb_from(src, uid)
+                return await reply(m, "✅ <b>Thumbnail</b> saved. Open /us to review.")
+            if value.strip() in ("-", "none", "None"):
+                S.delete_thumb(uid)
+                return await reply(m, "✅ <b>Thumbnail</b> removed.")
+            return await reply(m, "❌ Reply to a photo with <code>/us -s thumb</code> (or send <code>-</code> to remove).")
         return await reply(m, S.set_direct(uid, key, value))
     text, rows = S.panel(uid, "main", m.from_user)
     await reply(m, text, rows)
+
+
+PROMPT_TIMEOUT = 60
+
+
+async def expire_prompt(uid, p):
+    """After the timeout the prompt turns back into the menu (like WZML-X)."""
+    await asyncio.sleep(PROMPT_TIMEOUT)
+    if PENDING.get(uid) is p:
+        PENDING.pop(uid, None)
+        try:
+            text, rows = S.panel(uid, "m_" + p["kind"], p["user"])
+            await edit(p["msg"], text, rows)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.on_callback_query(filters.regex(r"^us\|"))
@@ -1154,21 +1264,24 @@ async def us_cb(_, q):
         key, value, target = args
         if key == "font" and value in U.FONTS:
             S.put(uid, "font", value)
-        elif key == "dest" and value in S.DEST_LABELS:
-            S.put(uid, "dest", value)
         elif key == "split" and value.isdigit():
             S.put(uid, "split", int(value))
         note = "Saved ✅"
-    elif act == "delthumb":
-        S.delete_thumb(uid)
-        target, note = args[0], "Thumbnail deleted"
+    elif act == "clr":
+        kind = args[0]
+        S.clear_value(uid, kind)
+        target, note = "m_" + kind, "Removed"
     elif act == "reset":
+        target = "confirm"
+    elif act == "resetyes":
         S.reset(uid)
         note = "All settings were reset"
     elif act == "ask":
-        kind, back = args
-        PENDING[uid] = {"kind": kind, "back": back, "msg": msg, "chat": msg.chat.id, "exp": time.time() + 120}
-        await edit(msg, S.prompt_text(kind), [[B("Cancel", S.cb(uid, "go", back), RED)]])
+        kind = args[0]
+        pend = {"kind": kind, "msg": msg, "chat": msg.chat.id, "exp": time.time() + PROMPT_TIMEOUT, "user": q.from_user}
+        PENDING[uid] = pend
+        await edit(msg, S.prompt_text(uid, kind), S.prompt_rows(uid, kind))
+        spawn(expire_prompt(uid, pend))
         return await q.answer()
 
     text, rows = S.panel(uid, target, q.from_user)
@@ -1194,16 +1307,27 @@ async def pending_h(_, m):
     p = PENDING.pop(uid)
     kind = p["kind"]
     if kind == "thumb":
-        is_img = m.photo or (m.document and (m.document.mime_type or "").startswith("image"))
-        if is_img:
-            raw = await m.download(file_name=str(S.THUMBS / f"{uid}_raw"))
-            S.prep_thumb(raw, S.THUMBS / f"{uid}.jpg")
-            os.remove(raw)
+        if is_image_msg(m):
+            await save_thumb_from(m, uid)
         elif (m.text or "").strip() == "-":
             S.delete_thumb(uid)
         else:
             PENDING[uid] = p
             return await reply(m, "❌ Please send a photo (or <code>-</code> to delete the thumbnail).")
+    elif kind == "rclone":
+        if not m.document:
+            PENDING[uid] = p
+            return await reply(m, "❌ Please send the <code>rclone.conf</code> file.")
+        path = str(S.RCLONE / f"{uid}.conf")
+        await m.download(file_name=path)
+        try:
+            ok = "[" in open(path, encoding="utf-8", errors="ignore").read(200000)
+        except OSError:
+            ok = False
+        if not ok:
+            S.delete_rclone(uid)
+            PENDING[uid] = p
+            return await reply(m, "❌ That does not look like an rclone.conf (no <code>[remote]</code> section).")
     else:
         result = S.set_direct(uid, kind, (m.text or "").strip())
         if result.startswith("❌"):
@@ -1213,7 +1337,7 @@ async def pending_h(_, m):
         await m.delete()
     except Exception:  # noqa: BLE001 - bot is not an admin in this group
         pass
-    text, rows = S.panel(uid, p["back"], m.from_user)
+    text, rows = S.panel(uid, "m_" + kind, p["user"])
     await edit(p["msg"], text, rows)
 
 

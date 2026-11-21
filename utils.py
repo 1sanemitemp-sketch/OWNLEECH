@@ -2,6 +2,8 @@
 import html
 import os
 import re
+from html.parser import HTMLParser
+from urllib.parse import unquote
 
 
 # ----------------------------------------------------------------- formatting
@@ -91,8 +93,18 @@ def apply_rules(filename, settings):
     new = re.sub(r"\s{2,}", " ", new).strip()
     if not new:
         new = stem
-    new = f"{settings.get('prefix', '')}{new}{settings.get('suffix', '')}"
+    prefix = (settings.get("prefix") or "").replace(r"\s", " ")
+    suffix = (settings.get("suffix") or "").replace(r"\s", " ")
+    new = f"{prefix}{new}{suffix}"
     return safe_filename(new + ext)
+
+
+def tidy_name(name):
+    """Underscores -> spaces (and %20 style escapes decoded) so names look like the original title."""
+    stem, ext = os.path.splitext(name)
+    stem = unquote(stem).replace("_", " ")
+    stem = re.sub(r"\s{2,}", " ", stem).strip()
+    return safe_filename((stem or name) + ext) if stem else name
 
 
 def parse_size(text):
@@ -106,12 +118,91 @@ def parse_size(text):
         return None
 
 
+# ----------------------------------------------------------------- media type
+VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v", ".ts", ".3gp", ".mpg", ".mpeg",
+             ".mts", ".m2ts", ".ogv"}
+AUDIO_EXT = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".oga", ".opus", ".aac", ".wma", ".mka", ".ac3"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def media_kind(path):
+    """video | audio | image | other. Extension based: Python's mimetypes does not know .mkv."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in AUDIO_EXT:
+        return "audio"
+    if ext in IMAGE_EXT:
+        return "image"
+    return "other"
+
+
 # ----------------------------------------------------------------- caption
 CAPTION_VARS = ("filename", "size", "duration", "resolution", "ext")
+ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a", "blockquote",
+                "tg-spoiler"}
+_TAG = re.compile(r"<(/?)([a-zA-Z][\w-]*)([^<>]*)>")
+
+
+def _clean_html(text):
+    """Keep Telegram-supported tags, escape everything else."""
+    out, pos = [], 0
+    for m in _TAG.finditer(text):
+        out.append(html.escape(text[pos : m.start()]))
+        closing, name, attrs = m.group(1), m.group(2).lower(), m.group(3)
+        if name in ALLOWED_TAGS:
+            if name == "a" and not closing:
+                href = re.search(r"href\s*=\s*[\"']([^\"']+)[\"']", attrs)
+                if href and href.group(1).startswith(("http://", "https://", "tg://")):
+                    out.append(f'<a href="{html.escape(href.group(1), quote=True)}">')
+                else:
+                    out.append(html.escape(m.group(0)))
+            else:
+                out.append(f"</{name}>" if closing else f"<{name}>")
+        else:
+            out.append(html.escape(m.group(0)))
+        pos = m.end()
+    out.append(html.escape(text[pos:]))
+    return "".join(out)
+
+
+class _Balance(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.stack, self.ok = [], True
+
+    def handle_starttag(self, tag, attrs):
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1] != tag:
+            self.ok = False
+        else:
+            self.stack.pop()
+
+
+def _balanced(text):
+    p = _Balance()
+    try:
+        p.feed(text)
+        p.close()
+    except Exception:  # noqa: BLE001
+        return False
+    return p.ok and not p.stack
+
+
+def _fit(escaped_builder, limit=1000):
+    """Build escaped text; shorten the raw text until it fits Telegram's caption limit."""
+    raw = escaped_builder
+    escaped = html.escape(raw)
+    while len(escaped) > limit and raw:
+        raw = raw[:-20]
+        escaped = html.escape(raw)
+    return escaped
 
 
 def render_caption(settings, filename, size, duration=0, width=0, height=0):
-    """Build the HTML caption: template -> escape -> apply the user's chosen font."""
+    """Build the HTML caption: template -> (safe HTML tags kept) -> chosen font."""
     template = settings.get("caption") or "{filename}"
     values = {
         "filename": filename,
@@ -120,10 +211,21 @@ def render_caption(settings, filename, size, duration=0, width=0, height=0):
         "resolution": f"{height}p" if height else "N/A",
         "ext": os.path.splitext(filename)[1].lstrip(".").upper() or "N/A",
     }
-    raw_text = re.sub(r"\{(\w+)\}", lambda m: str(values.get(m.group(1), m.group(0))), template)
-    raw_text = raw_text[:1000]
-    escaped = html.escape(raw_text)
-    while len(escaped) > 1000 and raw_text:  # escaping can grow the text
-        raw_text = raw_text[:-20]
-        escaped = html.escape(raw_text)
-    return font_wrap(escaped, settings.get("font", "default"))
+    inner, plain = [], []
+    for part in re.split(r"(\{\w+\})", template):
+        key = part[1:-1] if part.startswith("{") and part.endswith("}") else None
+        if key in values:
+            inner.append(html.escape(str(values[key])))
+            plain.append(str(values[key]))
+        else:
+            inner.append(_clean_html(part))
+            plain.append(part)
+    rich = "".join(inner)
+    has_tags = bool(re.search(r"<[a-z/]", rich))
+    if not _balanced(rich) or len(rich) > 1000:
+        rich = _fit("".join(plain))  # broken / too long tags -> show as plain text
+        has_tags = False
+    font = settings.get("font", "default")
+    if has_tags and font in ("mono", "pre"):  # Telegram cannot nest tags inside code / pre
+        font = "default"
+    return font_wrap(rich, font)
