@@ -46,6 +46,19 @@ Auto Rename placeholders: `{name} {year} {season} {episode} {quality} {resolutio
 Order applied to a file name: Auto Rename -> underscores to spaces -> Remove -> Replace -> Prefix / Suffix.
 A name given with `-n` is used exactly as typed.
 
+## Premium 4GB (STRING_SESSION)
+Put the string session of a **Telegram Premium** account in `STRING_SESSION`. Files bigger than 2GB are then uploaded
+by that account and copied by the bot to the user. The account does not have to be admin of any channel; open the bot
+with that account once. Without Premium (or without the variable) the 2GB bot limit stays.
+
+## Log channels
+`ALL_LOG_ID` is the default for all logs. `LINKS_LOG_ID` = every leech link + user, `LEECH_LOG_ID` = a copy of every
+file, `MIRROR_LOG_ID` = reserved (no mirror in this bot). The bot must be admin of those channels.
+
+## Data storage
+`DATABASE_URL` (MongoDB) stores settings, thumbnails, authorized users, limits and the bot login, so nothing is lost
+on Railway without a volume. Without it `/data` (a volume) is used.
+
 ## Deploy on Railway
 1. Upload all files of this folder to the root of your GitHub repo (replace old ones, see the list in the chat).
 2. Railway -> Deploy from GitHub repo (the Dockerfile is detected).

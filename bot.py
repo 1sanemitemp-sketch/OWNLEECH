@@ -24,6 +24,7 @@ import psutil
 import yt_dlp
 
 import config as C
+import db
 import fastupload
 import limits
 import rename_utils as R
@@ -64,21 +65,50 @@ asyncio.set_event_loop(loop)
 
 
 def make_client():
+    db.init()
+    bot_id = (C.BOT_TOKEN.split(":")[0] or "0") if C.BOT_TOKEN else "0"
+    saved_session = db.kv_get(f"session_{bot_id}") if db.ENABLED else None
     wanted = {
         "api_id": C.API_ID,
         "api_hash": C.API_HASH,
         "bot_token": C.BOT_TOKEN,
         "parse_mode": enums.ParseMode.HTML,
-        "in_memory": True,
+        "in_memory": False,  # keep the auth key: a fresh key on every restart makes Telegram answer 500
+        "workdir": str(limits.DATA),
         "workers": 16,
         "max_concurrent_transmissions": 8,
         "sleep_threshold": 60,
     }
+    if saved_session:  # login stored in MongoDB: no new auth key on every restart, no volume needed
+        wanted["session_string"] = saved_session
+        wanted["in_memory"] = True
     accepted = set(inspect.signature(Client.__init__).parameters)
-    return Client("leechbot", **{k: v for k, v in wanted.items() if k in accepted})
+    return Client(f"leechbot_{bot_id}", **{k: v for k, v in wanted.items() if k in accepted})
+
+
+def make_user_client():
+    """Premium account (STRING_SESSION) used only for uploads bigger than 2 GB."""
+    if not C.STRING_SESSION:
+        return None
+    wanted = {
+        "api_id": C.API_ID,
+        "api_hash": C.API_HASH,
+        "session_string": C.STRING_SESSION,
+        "parse_mode": enums.ParseMode.HTML,
+        "in_memory": True,
+        "no_updates": True,
+        "workers": 4,
+        "max_concurrent_transmissions": 8,
+        "sleep_threshold": 60,
+    }
+    accepted = set(inspect.signature(Client.__init__).parameters)
+    return Client("leechuser", **{k: v for k, v in wanted.items() if k in accepted})
 
 
 app = make_client()
+USER = make_user_client()  # started in main() only when the account is Premium
+USER_ID = 0
+STAGE = {}  # token -> future resolved when the bot receives the staged upload of the premium account
 
 BOOT = time.time()
 SESSION: aiohttp.ClientSession = None
@@ -101,7 +131,8 @@ ARIA_PROC = None
 
 AUTH_DB = S.DATA / "auth.json"
 try:
-    AUTH = set(json.loads(AUTH_DB.read_text()))
+    _saved_auth = db.kv_get("auth") if db.ENABLED else None
+    AUTH = set(_saved_auth if _saved_auth is not None else json.loads(AUTH_DB.read_text()))
 except Exception:  # noqa: BLE001
     AUTH = set()
 
@@ -110,6 +141,7 @@ def save_auth():
     tmp = AUTH_DB.with_suffix(".tmp")
     tmp.write_text(json.dumps(sorted(AUTH)))
     os.replace(tmp, AUTH_DB)
+    db.kv_set("auth", sorted(AUTH))
 
 
 # ------------------------------------------------------------------ helpers
@@ -757,6 +789,27 @@ async def mediainfo_markup(path):
     return KB([[B("📄 MediaInfo", url=link)]]) if link else None
 
 
+async def log_send(kind, text):
+    """Post a text log (never raises - a missing channel or permission must not break a task)."""
+    chat = C.log_id(kind)
+    if not chat:
+        return
+    try:
+        await send(app, chat, text)
+    except Exception as e:  # noqa: BLE001
+        log.warning("log channel %s (%s) failed: %r - is the bot an admin there?", kind, chat, e)
+
+
+async def log_copy(kind, sent):
+    chat = C.log_id(kind)
+    if not chat:
+        return
+    try:
+        await app.copy_message(chat, sent.chat.id, sent.id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("log channel %s (%s) copy failed: %r - is the bot an admin there?", kind, chat, e)
+
+
 def md5_of(path):
     h = hashlib.md5()
     with open(path, "rb") as fp:
@@ -795,7 +848,9 @@ async def send_file(t, f, s, thumb, prog):
     th = cv = thumb
     if is_video and not thumb:
         th, cv = await make_covers(f, dur, f"{t.id}_{tag}")
-    if not s["as_doc"] and is_video:
+    if USER and size > C.SPLIT_SIZE:  # bigger than a bot can upload -> Premium account, then the bot copies it
+        sent = await send_via_user(t, f, kind, s, caption, kw.get("reply_markup"), th, cv, info, name, prog)
+    elif not s["as_doc"] and is_video:
         extra_kw = {"cover": cv} if (COVER_OK and cv) else {}
         sent = await app.send_video(
             video=f, duration=dur, width=w, height=h, thumb=th, supports_streaming=True,
@@ -813,6 +868,7 @@ async def send_file(t, f, s, thumb, prog):
         )
 
     delivered = [(name, sent)]
+    spawn(log_copy("leech", sent))
     for extra in t.dests[1:]:
         try:
             delivered.append((name, await copy_to(sent, extra, reply_kwargs(t.cmd.id) if in_group(extra) else {})))
@@ -822,6 +878,62 @@ async def send_file(t, f, s, thumb, prog):
     if is_video and s["shots"] and not t.cancel:
         await send_shots(t, f, dur, s["shots"], rk, tag)
     return delivered
+
+
+async def send_via_user(t, f, kind, s, caption, markup, th, cv, info, name, prog):
+    """Upload with the Premium string session (up to 4 GB) into the bot's own PM, then let the bot copy it.
+
+    The Premium account never has to join or administer any channel: the bot simply receives the file
+    in its private chat with that account and copies it to the real destination.
+    """
+    token = secrets.token_hex(4)
+    fut = asyncio.get_running_loop().create_future()
+    STAGE[token] = fut
+    common = dict(chat_id=BOT_USERNAME, caption=f"#L{token}", progress=prog)
+    dur, w, h = info.get("duration", 0), info.get("width", 0), info.get("height", 0)
+    staged_by_user = None
+    try:
+        if not s["as_doc"] and kind == "video":
+            extra_kw = {"cover": cv} if (COVER_OK and cv) else {}
+            staged_by_user = await USER.send_video(
+                video=f, duration=dur, width=w, height=h, thumb=th, supports_streaming=True,
+                **extra_kw, **with_name(USER.send_video, name), **common,
+            )
+        elif not s["as_doc"] and kind == "audio":
+            staged_by_user = await USER.send_audio(
+                audio=f, duration=dur, thumb=th, **with_name(USER.send_audio, name), **common
+            )
+        else:
+            staged_by_user = await USER.send_document(
+                document=f, thumb=th, force_document=True, **with_name(USER.send_document, name), **common
+            )
+        staged = await asyncio.wait_for(fut, 120)  # the same message, as received by the bot
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(
+            "The bot did not receive the file from the Premium account. Open the bot with that account "
+            "and press Start once, then try again."
+        ) from e
+    finally:
+        STAGE.pop(token, None)
+    extra = {"reply_markup": markup} if markup else {}
+    try:
+        return await app.copy_message(t.dests[0], staged.chat.id, staged.id, caption=caption, **extra)
+    finally:
+        try:
+            await USER.delete_messages(staged_by_user.chat.id, staged_by_user.id)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.on_message(filters.private & (filters.document | filters.video | filters.audio), group=-1)
+async def stage_handler(_, m):
+    """Receives the staged upload sent by the Premium account (see send_via_user)."""
+    if not USER_ID or not m.from_user or m.from_user.id != USER_ID:
+        return
+    token = re.match(r"#L([0-9a-f]{8})$", m.caption or "")
+    fut = STAGE.get(token.group(1)) if token else None
+    if fut and not fut.done():
+        fut.set_result(m)
 
 
 async def send_shots(t, f, dur, n, rk, tag):
@@ -1125,11 +1237,12 @@ async def ping_cmd(_, m):
 
 # ------------------------------------------------------------------ handlers: /stats
 def uploader_line():
+    extra = " · 4GB ✅" if USER else ""
     if not C.FAST_UPLOAD:
-        return "Library default"
+        return "Library default" + extra
     return (
         f"Fast ({C.UPLOAD_SESSIONS}x{C.UPLOAD_WORKERS}) · done {fastupload.STATS['fast']}"
-        f" / fallback {fastupload.STATS['fallback']}"
+        f" / fallback {fastupload.STATS['fallback']}" + extra
     )
 
 
@@ -1290,6 +1403,15 @@ async def leech_cmd(_, m):
     S.bump_daily(uid)
     t = Task(m, link, z, e, name, thumb, dests)
     TASKS[t.id] = t
+    spawn(
+        log_send(
+            "links",
+            f"🔗 <b>New leech</b>\n┌ <b>User</b> : {m.from_user.mention} (<code>{uid}</code>)\n"
+            f"├ <b>Chat</b> : <code>{m.chat.id}</code>\n"
+            f"├ <b>Task</b> : <code>{t.id}</code>\n"
+            f"└ <b>Link</b> : <code>{html.escape(U.shorten(link, 300))}</code>",
+        )
+    )
     spawn(run_task(t))
     await ensure_status(m.chat.id, m)
 
@@ -1461,6 +1583,7 @@ async def save_thumb_from(m, uid):
     finally:
         if os.path.exists(raw):
             os.remove(raw)
+    S.sync_thumb(uid)
 
 
 @app.on_message(filters.command(cmds("usetting", "us")))
@@ -1618,6 +1741,8 @@ async def pending_h(_, m):
             ok = "[" in open(path, encoding="utf-8", errors="ignore").read(200000)
         except OSError:
             ok = False
+        if ok:
+            S.sync_rclone(uid)
         if not ok:
             S.delete_rclone(uid)
             PENDING[uid] = p
@@ -1637,25 +1762,65 @@ async def pending_h(_, m):
 
 # ------------------------------------------------------------------ main
 async def main():
-    global SESSION, BOT_USERNAME
+    global SESSION, BOT_USERNAME, USER, USER_ID
     shutil.rmtree(C.DOWNLOAD_DIR, ignore_errors=True)
     os.makedirs(C.DOWNLOAD_DIR, exist_ok=True)
+    if not (C.API_ID and C.API_HASH and C.BOT_TOKEN):
+        raise SystemExit("API_ID, API_HASH and BOT_TOKEN must be set in config.env (or as variables).")
     SESSION = aiohttp.ClientSession()
     await start_aria()
-    await app.start()
+    try:
+        await app.start()
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "Telegram login failed: %r\nCheck API_ID / API_HASH (my.telegram.org) and BOT_TOKEN (@BotFather): "
+            "no spaces or quotes, token must be the newest one.", e,
+        )
+        raise
     me = await app.get_me()
     BOT_USERNAME = me.username or ""
+    if db.ENABLED:  # remember the bot login so the next start (even on a fresh container) reuses it
+        key = f"session_{me.id}"
+        try:
+            if db.kv_get(key) is None:
+                db.kv_set(key, await app.export_session_string())
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not store the bot session: %r", e)
+    if USER:
+        try:
+            await USER.start()
+            user_me = await USER.get_me()
+            if getattr(user_me, "is_premium", False):
+                USER_ID = user_me.id
+                S.MAX_UPLOAD = C.PREMIUM_SPLIT
+                fastupload.install(USER)
+                log.info("Premium string session active (%s): uploads up to 4GB", user_me.first_name)
+            else:
+                log.warning("STRING_SESSION account is not Premium - staying on the 2GB bot limit")
+                await USER.stop()
+                USER = None
+        except Exception as e:  # noqa: BLE001
+            log.error("STRING_SESSION could not start (%r) - staying on the 2GB bot limit", e)
+            USER = None
     await init_styles(app)
     fastupload.install(app)
     await setup_commands()
     psutil.cpu_percent()  # prime the counter so the first reading is meaningful
     spawn(status_loop())
-    if S.PERSISTENT:
+    if db.ENABLED:
+        log.info("Data is stored in MongoDB")
+    elif S.PERSISTENT:
         log.info("Persistent volume mounted at %s", S.DATA)
     else:
         log.warning("No volume mounted at %s - settings and thumbnails are lost on redeploy!", S.DATA)
     log.info("Bot started as @%s using %s", BOT_USERNAME, LIB_LABEL)
     await tg.idle()
+    db.flush()
+    if USER:
+        try:
+            await USER.stop()
+        except Exception:  # noqa: BLE001
+            pass
     await app.stop()
     if ARIA_PROC:
         ARIA_PROC.terminate()

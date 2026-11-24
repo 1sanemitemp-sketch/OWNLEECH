@@ -61,12 +61,33 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = _int("OWNER_ID", 0)
 
+# Premium account string session -> uploads up to 4 GB (a normal bot is limited to 2 GB).
+# The premium account does NOT need to join / administer any channel.
+STRING_SESSION = _str("STRING_SESSION")
+
+# MongoDB connection string. Keeps settings, thumbnails, authorized users, limits and the bot login
+# between restarts without any volume (handy on Railway). Without it /data (volume) is used.
+DATABASE_URL = _str("DATABASE_URL")
+
 # Comma separated user IDs / group IDs that may use the bot (owner is always allowed)
 AUTHORIZED_CHATS = {
     int(x)
     for x in os.environ.get("AUTHORIZED_CHATS", "").replace(" ", "").split(",")
     if x.lstrip("-").isdigit()
 }
+
+# --- Log channels (the bot must be admin there; nothing else is needed) ----
+# ALL_LOG_ID is the default for the three below. Set a specific one to send that log somewhere else.
+ALL_LOG_ID = _int("ALL_LOG_ID", 0)
+LINKS_LOG_ID = _int("LINKS_LOG_ID", 0)  # every leech link + who started it
+LEECH_LOG_ID = _int("LEECH_LOG_ID", 0)  # a copy of every leeched file
+MIRROR_LOG_ID = _int("MIRROR_LOG_ID", 0)  # reserved for mirror tasks (this bot only leeches)
+
+
+def log_id(kind):
+    """Chat id for log ``kind`` ("links" | "leech" | "mirror"), 0 when logging is off."""
+    return {"links": LINKS_LOG_ID, "leech": LEECH_LOG_ID, "mirror": MIRROR_LOG_ID}[kind] or ALL_LOG_ID
+
 
 # --- Commands / start message ----------------------------------------------
 # COMMAND_SUFFIX=1  ->  /leech1 /l1 /usetting1 /us1 /status1 ... (/start never changes)
@@ -89,6 +110,7 @@ UPLOAD_PARALLEL = max(1, _int("UPLOAD_PARALLEL", 1))  # files of one task upload
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/downloads")
 # Telegram bot upload limit is 2000 MiB per file; bigger files are split automatically.
 SPLIT_SIZE = _int("SPLIT_SIZE", 2097152000)
+PREMIUM_SPLIT = 4000 * 1024 * 1024  # used automatically when STRING_SESSION is a Premium account
 ARIA_SECRET = os.environ.get("ARIA_SECRET", "leechsecret")
 
 # --- Thumbnails ------------------------------------------------------------
@@ -109,7 +131,10 @@ UPLOAD_WORKERS = max(1, min(_int("UPLOAD_WORKERS", 6), 8))  # in-flight requests
 
 # --- Repo stats (/stats -> Repo Stats) -------------------------------------
 BOT_VERSION = _str("BOT_VERSION", "v1.5.0")
-UPSTREAM_REPO = _str("UPSTREAM_REPO", "")  # "owner/repo" on GitHub
+UPSTREAM_REPO = (
+    _str("UPSTREAM_REPO", "")  # "owner/repo" or the full GitHub URL
+    .replace("https://github.com/", "").replace("http://github.com/", "").removesuffix("/").removesuffix(".git")
+)
 UPSTREAM_BRANCH = _str("UPSTREAM_BRANCH", "main")
 
 # --- Persistent data (settings, thumbnails, auth list) --------------------

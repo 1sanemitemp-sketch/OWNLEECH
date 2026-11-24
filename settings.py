@@ -13,6 +13,7 @@ from pathlib import Path
 from PIL import Image
 
 import config as C
+import db
 import limits
 import rename_utils
 from compat import GREEN, RED, B
@@ -38,6 +39,21 @@ try:
     USERS = json.loads(DB.read_text())
 except Exception:  # noqa: BLE001
     USERS = {}
+
+MAX_UPLOAD = C.SPLIT_SIZE  # biggest file Telegram accepts for this bot (raised to 4 GB with a Premium string session)
+
+if db.init():  # MongoDB is the source of truth when DATABASE_URL is set
+    _remote = db.users_all()
+    if _remote:
+        USERS = _remote
+        DB.write_text(json.dumps(USERS))
+    else:  # first start with MongoDB: upload what we already have
+        for _uid, _data in USERS.items():
+            db.user_set(_uid, _data)
+    for _uid, _blob in db.files_all("thumb").items():
+        (THUMBS / f"{_uid}.jpg").write_bytes(_blob)
+    for _uid, _blob in db.files_all("rclone").items():
+        (RCLONE / f"{_uid}.conf").write_bytes(_blob)
 
 DEFAULT = {
     "as_doc": False,  # False = Media, True = Document
@@ -83,6 +99,7 @@ def _save():
 def put(uid, key, value):
     USERS.setdefault(str(uid), {})[key] = value
     _save()
+    db.user_set(uid, USERS[str(uid)])
 
 
 def has_changes(uid):
@@ -97,8 +114,10 @@ def reset(uid):
     keep = {k: v for k, v in USERS.get(str(uid), {}).items() if k in INTERNAL}
     if keep:
         USERS[str(uid)] = keep
+        db.user_set(uid, keep)
     else:
         USERS.pop(str(uid), None)
+        db.user_del(uid)
     _save()
     delete_thumb(uid)
     delete_rclone(uid)
@@ -114,6 +133,18 @@ def delete_thumb(uid):
     p = THUMBS / f"{uid}.jpg"
     if p.exists():
         p.unlink()
+    db.file_del("thumb", uid)
+
+
+def sync_thumb(uid):
+    """Push the saved thumbnail of ``uid`` to MongoDB (no-op without DATABASE_URL)."""
+    if db.ENABLED and thumb_of(uid):
+        db.file_set("thumb", uid, Path(thumb_of(uid)).read_bytes())
+
+
+def sync_rclone(uid):
+    if db.ENABLED and rclone_of(uid):
+        db.file_set("rclone", uid, Path(rclone_of(uid)).read_bytes())
 
 
 def prep_thumb(src, dst, max_bytes=200 * 1024):
@@ -141,10 +172,11 @@ def delete_rclone(uid):
     p = RCLONE / f"{uid}.conf"
     if p.exists():
         p.unlink()
+    db.file_del("rclone", uid)
 
 
 def split_limit(s):
-    return min(s["split"] or C.SPLIT_SIZE, C.SPLIT_SIZE)
+    return min(s["split"] or MAX_UPLOAD, MAX_UPLOAD)
 
 
 # ----------------------------------------------------------------- daily tasks / last used
@@ -501,7 +533,7 @@ def _split(uid, s, user):
     text = (
         "<b><u>☰ Leech Split Size :</u></b>\n\n"
         f"➲ <b>Current</b> : <i>{'Auto' if not s['split'] else hsize(s['split'])}</i>\n"
-        f"➲ <b>Telegram limit</b> : <i>{hsize(C.SPLIT_SIZE)} per file</i>\n\n"
+        f"➲ <b>Telegram limit</b> : <i>{hsize(MAX_UPLOAD)} per file</i>\n\n"
         "Files bigger than the selected size are split into parts."
     )
     rows, row = [], []
@@ -566,7 +598,7 @@ def set_direct(uid, key, value):
             size = parse_size(value)
             if not size or size < 50 * 1024**2:
                 return "❌ Use a size like <code>1gb</code>, <code>500mb</code> or <code>auto</code> (min 50MB)."
-            put(uid, "split", min(size, C.SPLIT_SIZE))
+            put(uid, "split", min(size, MAX_UPLOAD))
     elif key == "mode":
         if value.lower() not in ("media", "document", "doc"):
             return "❌ Mode must be <code>media</code> or <code>document</code>"

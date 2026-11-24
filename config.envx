@@ -1,8 +1,8 @@
 # =====================================================================
-#  config.envx  -  SAMPLE. On your server run:  cp config.envx config.env  then edit config.env Railway variables with the
-#  same name always override what is written here.
-#  Do NOT push real secrets (BOT_TOKEN, API_HASH) to a public GitHub repo:
-#  put them in Railway variables instead.
+#  config.envx  -  SAMPLE FILE
+#  On your server:   cp config.envx config.env   then edit config.env
+#  Railway variables with the same name always override config.env.
+#  Do NOT push real secrets (BOT_TOKEN, API_HASH, STRING_SESSION) to a public GitHub repo.
 # =====================================================================
 
 # ---- Required ----
@@ -11,10 +11,31 @@ API_HASH=
 BOT_TOKEN=
 OWNER_ID=
 
+# ---- Premium string session (optional) ----
+# A Telegram Premium account's Pyrogram string session. With it the bot uploads files up to 4GB.
+# The premium account does NOT need to be admin of any channel. Just open the bot with that account once.
+STRING_SESSION=
+
 # ---- Access ----
 # Comma separated user IDs / group IDs allowed to use the bot (owner is always allowed).
 # You can also use /a and /ua inside Telegram.
 AUTHORIZED_CHATS=
+
+# ---- Database (optional) ----
+# MongoDB URL. Saves settings, thumbnails, authorized users, limits and the bot login (no volume needed).
+# Example: mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/leechbot
+# Empty = data is kept in /data (Docker volume / Railway volume).
+DATABASE_URL=
+
+# ---- Log channels (optional, the bot must be admin there) ----
+# ALL_LOG_ID is used for every log that has no own id below.
+ALL_LOG_ID=
+# Every leech link + who started it
+LINKS_LOG_ID=
+# A copy of every leeched file
+LEECH_LOG_ID=
+# Reserved for mirror tasks (this bot only leeches)
+MIRROR_LOG_ID=
 
 # ---- /start message ----  (BUTTON FORMAT  =  Text:URL)
 ST_TEXT=Now, This bot will send all your files and links here. Start Using ...

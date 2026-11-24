@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import config as C
+import db
 
 DATA = Path(C.DATA_DIR)
 try:
@@ -24,8 +25,11 @@ DEFS = {
     "parallel": ("Parallel Uploads", "UPLOAD_PARALLEL", int, "files"),
 }
 
+db.init()
 try:
-    _OVERRIDES = json.loads(FILE.read_text())
+    _OVERRIDES = db.kv_get("botsettings") if db.ENABLED else None
+    if _OVERRIDES is None:
+        _OVERRIDES = json.loads(FILE.read_text())
 except Exception:  # noqa: BLE001
     _OVERRIDES = {}
 
@@ -44,6 +48,7 @@ def put(key, value):
     tmp = FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(_OVERRIDES))
     os.replace(tmp, FILE)
+    db.kv_set("botsettings", dict(_OVERRIDES))
 
 
 def text(key):
