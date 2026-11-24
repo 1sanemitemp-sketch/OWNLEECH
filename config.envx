@@ -50,5 +50,5 @@ TASKS_PER_PAGE=5
 
 # ---- Repo stats (/stats -> Repo Stats), optional ----
 BOT_VERSION=v1.5.0
-UPSTREAM_REPO=
+UPSTREAM_REPO=https://github.com/1sanemitemp-sketch/OWNLEECH
 UPSTREAM_BRANCH=main
