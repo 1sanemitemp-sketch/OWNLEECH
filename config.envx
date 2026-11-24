@@ -1,0 +1,54 @@
+# =====================================================================
+#  config.envx  -  SAMPLE. On your server run:  cp config.envx config.env  then edit config.env Railway variables with the
+#  same name always override what is written here.
+#  Do NOT push real secrets (BOT_TOKEN, API_HASH) to a public GitHub repo:
+#  put them in Railway variables instead.
+# =====================================================================
+
+# ---- Required ----
+API_ID=
+API_HASH=
+BOT_TOKEN=
+OWNER_ID=
+
+# ---- Access ----
+# Comma separated user IDs / group IDs allowed to use the bot (owner is always allowed).
+# You can also use /a and /ua inside Telegram.
+AUTHORIZED_CHATS=
+
+# ---- /start message ----  (BUTTON FORMAT  =  Text:URL)
+ST_TEXT=Now, This bot will send all your files and links here. Start Using ...
+ST_BUTTON_1= OWNER:https://t.me/sanemi111
+ST_BUTTON_2= UPDATES:https://t.me/+RubcD9bIv8tlY2I1
+
+# ---- Commands ----
+# COMMAND_SUFFIX=1 gives /leech1 /l1 /usetting1 /us1 /status1 /stats1 ... (/start stays the same)
+COMMAND_SUFFIX=
+
+# ---- Limits (0 = unlimited). Owner is never limited. Owner can change them live with /botsettings ----
+BOT_MAX_TASKS=8
+USER_MAX_TASKS=2
+LEECH_LIMIT=0
+DIRECT_LIMIT=0
+YTDLP_LIMIT=0
+DAILY_TASK_LIMIT=0
+
+# ---- Upload speed ----
+FAST_UPLOAD=1
+UPLOAD_SESSIONS=12
+UPLOAD_WORKERS=6
+# Files of one task uploaded at the same time. 1 keeps the order of episodes, 2-3 is faster for many files.
+UPLOAD_PARALLEL=1
+
+# ---- Thumbnails ----
+THUMB_MAX=1280
+USE_COVER=1
+
+# ---- Status message ----
+STATUS_INTERVAL=6
+TASKS_PER_PAGE=5
+
+# ---- Repo stats (/stats -> Repo Stats), optional ----
+BOT_VERSION=v1.5.0
+UPSTREAM_REPO=
+UPSTREAM_BRANCH=main

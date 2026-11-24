@@ -8,7 +8,10 @@ services:
     build: .
     init: true
     restart: unless-stopped
-    env_file: .env
+    # config.env is baked into the image (edit it, then: docker compose up -d --build).
+    # Variables set here override config.env:
+    # environment:
+    #   BOT_TOKEN: ${BOT_TOKEN}
     volumes:
       - data:/data
     logging:

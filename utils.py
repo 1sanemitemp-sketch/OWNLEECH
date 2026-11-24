@@ -82,21 +82,81 @@ def safe_filename(name):
     return (stem + ext) or "file"
 
 
-def apply_rules(filename, settings):
-    """remove words -> replace pairs -> prefix / suffix. Extension is never touched."""
+def parse_remove(text):
+    """``Love|Power|R:www\\.site\\.com[\\s_-]*``  ->  [(is_regex, pattern), ...]. Raises ValueError."""
+    rules = []
+    for raw in re.split(r"(?<!\\)\|", text or ""):
+        rule = raw.strip().replace("\\|", "|")
+        if not rule:
+            continue
+        if rule.startswith("R:"):
+            pattern = rule[2:]
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                raise ValueError(f"Invalid regex <code>{html.escape(pattern)}</code>: {html.escape(str(e))}") from e
+            rules.append((True, pattern))
+        else:
+            rules.append((False, rule))
+    return rules
+
+
+def parse_replace(text):
+    """One rule per line ``OLD|NEW|CASE|TIMES``  ->  [(old, new, ignore_case, times), ...]. Raises ValueError."""
+    rules = []
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        old = parts[0].strip()
+        if not old:
+            raise ValueError(f"Rule <code>{html.escape(line)}</code> has no OLD text.")
+        new = parts[1] if len(parts) > 1 else ""
+        case = parts[2].strip().upper() if len(parts) > 2 else "0"
+        if case not in ("", "0", "1", "I"):
+            raise ValueError(f"CASE must be 0, 1 or I in <code>{html.escape(line)}</code>")
+        times = parts[3].strip() if len(parts) > 3 else "0"
+        if times and not times.isdigit():
+            raise ValueError(f"TIMES must be a number in <code>{html.escape(line)}</code>")
+        rules.append((old, new, case not in ("1", "I"), int(times or 0)))
+    return rules
+
+
+def clean_name(filename, settings):
+    """Remove rules, then replace rules (top to bottom). The extension is never touched."""
     stem, ext = os.path.splitext(filename)
     new = stem
-    for word in parse_words(settings.get("remove", "")):
-        new = re.sub(re.escape(word), "", new, flags=re.I)
-    for old, rep in parse_pairs(settings.get("replace", "")):
-        new = re.sub(re.escape(old), lambda _m, r=rep: r, new, flags=re.I)
-    new = re.sub(r"\s{2,}", " ", new).strip()
-    if not new:
+    try:
+        for is_regex, pattern in parse_remove(settings.get("remove", "")):
+            new = re.sub(pattern, "", new) if is_regex else new.replace(pattern, "")
+        for old, rep, ignore_case, times in parse_replace(settings.get("replace", "")):
+            new = re.sub(re.escape(old), lambda _m, r=rep: r, new, count=times, flags=re.I if ignore_case else 0)
+    except (ValueError, re.error):
         new = stem
-    prefix = (settings.get("prefix") or "").replace(r"\s", " ")
-    suffix = (settings.get("suffix") or "").replace(r"\s", " ")
-    new = f"{prefix}{new}{suffix}"
-    return safe_filename(new + ext)
+    new = re.sub(r"\s{2,}", " ", new).strip()
+    return (new or stem) + ext
+
+
+def _plain_affix(text):
+    return re.sub(r"<.*?>", "", (text or "").replace("\\s", " "))
+
+
+def affix_name(filename, settings):
+    """Add prefix / suffix to the real file name (HTML tags are removed, ``\\s`` becomes a space)."""
+    stem, ext = os.path.splitext(filename)
+    return safe_filename(f"{_plain_affix(settings.get('prefix'))}{stem}{_plain_affix(settings.get('suffix'))}{ext}")
+
+
+def caption_name(filename, settings):
+    """Same as affix_name but for the caption: HTML tags in prefix / suffix are kept (already escaped HTML)."""
+    stem, ext = os.path.splitext(filename)
+    pre = _clean_html((settings.get("prefix") or "").replace("\\s", " "))
+    suf = _clean_html((settings.get("suffix") or "").replace("\\s", " "))
+    return f"{pre}{html.escape(stem)}{suf}{html.escape(ext)}"
+
+
+def apply_rules(filename, settings):
+    return affix_name(clean_name(filename, settings), settings)
 
 
 def tidy_name(name):
@@ -138,18 +198,20 @@ def media_kind(path):
 
 
 # ----------------------------------------------------------------- caption
-CAPTION_VARS = ("filename", "size", "duration", "resolution", "ext")
 ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a", "blockquote",
-                "tg-spoiler"}
+                "tg-spoiler", "spoiler"}
 _TAG = re.compile(r"<(/?)([a-zA-Z][\w-]*)([^<>]*)>")
+_PIPE, _LBRACE, _RBRACE = "\ue000", "\ue001", "\ue002"
 
 
 def _clean_html(text):
-    """Keep Telegram-supported tags, escape everything else."""
+    """Keep Telegram-supported tags (``<spoiler>`` is accepted too), escape everything else."""
     out, pos = [], 0
     for m in _TAG.finditer(text):
         out.append(html.escape(text[pos : m.start()]))
         closing, name, attrs = m.group(1), m.group(2).lower(), m.group(3)
+        if name == "spoiler":
+            name = "tg-spoiler"
         if name in ALLOWED_TAGS:
             if name == "a" and not closing:
                 href = re.search(r"href\s*=\s*[\"']([^\"']+)[\"']", attrs)
@@ -191,9 +253,7 @@ def _balanced(text):
     return p.ok and not p.stack
 
 
-def _fit(escaped_builder, limit=1000):
-    """Build escaped text; shorten the raw text until it fits Telegram's caption limit."""
-    raw = escaped_builder
+def _fit(raw, limit=1000):
     escaped = html.escape(raw)
     while len(escaped) > limit and raw:
         raw = raw[:-20]
@@ -201,31 +261,58 @@ def _fit(escaped_builder, limit=1000):
     return escaped
 
 
-def render_caption(settings, filename, size, duration=0, width=0, height=0):
-    """Build the HTML caption: template -> (safe HTML tags kept) -> chosen font."""
+def render_caption(settings, filename_html, size, info=None, md5=""):
+    """Build the HTML caption.
+
+    Template syntax (same as WZML-X):  ``\\s`` space, ``\\|`` a real |, variables
+    {filename} {size} {duration} {quality} {languages} {subtitles} {md5_hash}, and after the first
+    ``|`` any number of  ``key:new_key:count``  replacements.  ``filename_html`` is already escaped HTML.
+    """
+    info = info or {}
     template = settings.get("caption") or "{filename}"
+    template = (
+        template.replace("\\|", _PIPE).replace("\\{", _LBRACE).replace("\\}", _RBRACE).replace("\\s", " ")
+    )
+    parts = template.split("|")
+    body, rems = parts[0], parts[1:]
+    width, height = info.get("width", 0), info.get("height", 0)
+    plain_name = html.unescape(re.sub(r"<[^>]+>", "", filename_html))
     values = {
-        "filename": filename,
+        "filename": None,  # inserted as ready-made HTML
         "size": hsize(size),
-        "duration": htime(duration) if duration else "N/A",
+        "duration": htime(info.get("duration", 0)) if info.get("duration") else "N/A",
+        "quality": info.get("quality") or (f"{height}p" if height else "N/A"),
         "resolution": f"{height}p" if height else "N/A",
-        "ext": os.path.splitext(filename)[1].lstrip(".").upper() or "N/A",
+        "languages": info.get("languages") or "N/A",
+        "subtitles": info.get("subtitles") or "N/A",
+        "md5_hash": md5 or "N/A",
+        "ext": os.path.splitext(plain_name)[1].lstrip(".").upper() or "N/A",
     }
-    inner, plain = [], []
-    for part in re.split(r"(\{\w+\})", template):
-        key = part[1:-1] if part.startswith("{") and part.endswith("}") else None
-        if key in values:
-            inner.append(html.escape(str(values[key])))
+    rich, plain = [], []
+    for part in re.split(r"(\{\w+\})", body):
+        key = part[1:-1].lower() if part.startswith("{") and part.endswith("}") else None
+        if key == "filename":
+            rich.append(filename_html)
+            plain.append(plain_name)
+        elif key in values:
+            rich.append(html.escape(str(values[key])))
             plain.append(str(values[key]))
         else:
-            inner.append(_clean_html(part))
+            rich.append(_clean_html(part))
             plain.append(part)
-    rich = "".join(inner)
-    has_tags = bool(re.search(r"<[a-z/]", rich))
-    if not _balanced(rich) or len(rich) > 1000:
-        rich = _fit("".join(plain))  # broken / too long tags -> show as plain text
+    text = "".join(rich)
+    for rem in rems:  # key:new_key:count  (count empty / missing = every occurrence)
+        args = rem.split(":")
+        if not args[0]:
+            continue
+        count = int(args[2]) if len(args) >= 3 and args[2].strip().lstrip("-").isdigit() else -1
+        text = text.replace(args[0], args[1] if len(args) > 1 else "", count)
+    text = text.replace(_PIPE, "|").replace(_LBRACE, "{").replace(_RBRACE, "}")
+    has_tags = bool(re.search(r"<[a-z/]", text))
+    if not _balanced(text) or len(text) > 1000:
+        text = _fit("".join(plain).replace(_PIPE, "|").replace(_LBRACE, "{").replace(_RBRACE, "}"))
         has_tags = False
     font = settings.get("font", "default")
     if has_tags and font in ("mono", "pre"):  # Telegram cannot nest tags inside code / pre
         font = "default"
-    return font_wrap(rich, font)
+    return font_wrap(text, font)

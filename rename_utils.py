@@ -303,3 +303,18 @@ async def auto_renamed(template, original_name, path):
         return sanitize(new_name, extension)
     except Exception:  # noqa: BLE001
         return original_name
+
+
+async def probe_info(path):
+    """duration / width / height / quality / languages / subtitles of a media file (all empty when unknown)."""
+    info = await _ffprobe(path)
+    duration, quality, _codec, audio_langs, sub_langs = _media_facts(info)
+    width = height = 0
+    for s in info.get("streams") or []:
+        if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic"):
+            width, height = int(s.get("width") or 0), int(s.get("height") or 0)
+            break
+    return {
+        "duration": duration, "width": width, "height": height, "quality": quality,
+        "languages": ", ".join(audio_langs), "subtitles": ", ".join(sub_langs),
+    }

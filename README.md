@@ -1,63 +1,64 @@
-# Leech Bot (WZML-X style)
+# Leech Bot
 
-Telegram leech bot for direct links and yt-dlp sites. Built on `wzgram` (WzPyro) with a
-multi-session fast uploader, live WZML-X style status, per-user settings and PM delivery.
+Telegram leech bot (no torrents): direct links via aria2, video sites via yt-dlp, fast multi-session upload.
 
-## Commands (every command has a short form)
+## Files you edit
+- `config.envx` is the SAMPLE (kept in the repo). On your server copy it to `config.env` and edit that file:
+  `config.env` is git-ignored, so your secrets never get pushed and `git pull` never overwrites it.
+- Railway variables with the same name always override `config.env`.
 
-| Command | Short | What it does |
-|---|---|---|
-| `/leech <link>` | `/l` | Leech a link to Telegram |
-| `/usetting` | `/us` | Personal settings panel |
-| `/status` | `/s` | Live task status (pages, refresh) |
-| `/cancel [id]` | `/c`, `/c_ID` | Cancel a task |
-| `/cancelall` | `/ca` | Cancel all your tasks |
-| `/stats` | `/st` | Bot and server stats |
-| `/ping` | - | Response time |
-| `/help` | `/h` | Command guide |
-| `/authorize` | `/a` | Owner: authorize a user / group |
-| `/unauthorize` | `/ua` | Owner: remove authorization |
+## /start (everybody)
+Shows `ST_TEXT` and two buttons from `ST_BUTTON_1` / `ST_BUTTON_2` (format `Text:URL`).
+Every other command does nothing for users who are not authorized. Authorized users and authorized groups
+(`AUTHORIZED_CHATS`, `/a`, `/ua`) can use everything; the owner is never limited.
 
-The command menu is registered automatically on every start - nothing to set in BotFather.
+## Commands  (add `COMMAND_SUFFIX=1` to get /leech1 /l1 /us1 /st1 ... , `/start` never changes)
+| Command | What |
+|---|---|
+| `/leech link [-z] [-e] [-n name] [-t thumb_link]` (`/l`) | leech |
+| `/usetting` (`/us`) | personal settings |
+| `/status` (`/s`) | live status. A new task always posts a fresh status message |
+| `/cancel` (`/c`), `/c_ID`, `/cancelall` (`/ca`) | cancel |
+| `/stats` (`/st`) | Bot Stats, OS Stats, Repo Stats, Bot Limits |
+| `/botsettings` (`/bs`) | **owner only** - change limits live |
+| `/authorize` (`/a`), `/unauthorize` (`/ua`) | **owner only** |
 
-Leech arguments: `-z` zip, `-e` extract, `-n new name`, `-t thumbnail link`.
+## Limits (config.env or /botsettings, 0 = unlimited, owner never limited)
+`USER_MAX_TASKS`, `BOT_MAX_TASKS`, `LEECH_LIMIT`, `DIRECT_LIMIT`, `YTDLP_LIMIT` (GB), `DAILY_TASK_LIMIT`,
+`UPLOAD_PARALLEL`. There is no queue: when a limit is reached the new task is refused immediately.
+
+## Status
+Shows every task at once: Download -> Extract -> Archive -> Split -> Upload, each with its own progress.
+Upload shows one overall progress for all files of the task.
 
 ## Settings (`/us`)
-- **Universal**: YT-DLP Options, Daily Tasks, Last Bot Used, MediaInfo Mode, User Bot PM (always forced - files
-  from a group always go to the user's bot PM, users cannot change it)
-- **Mirror**: RClone (upload `rclone.conf`; stored only for now)
-- **Leech**: Send As Media/Document, Thumbnail, Leech Split Size, Equal Splits, Prefix, Suffix, Remove, Replace,
-  Caption, Caption Font, **Auto Rename**, Screenshots
-- The **Reset Setting** button only appears after you changed something and asks Yes / No first.
-- Direct set: `/us -s font bold`, `/us -s prefix [GRP]\s`, reply to a photo with `/us -s thumb`
+- Universal: YT-DLP Options, Daily Tasks, Last Bot Used, MediaInfo Mode, User Bot PM (forced)
+- Mirror: RClone
+- Leech: Send As Media/Document, Thumbnail, Split Size, Equal Splits, Prefix, Suffix, Remove, Replace,
+  Caption, Caption Font, Auto Rename, Screenshots
 
-## Thumbnails (HD)
-Priority: `-t` link (this leech only) > your saved thumbnail > a frame taken from the video itself.
-Thumbnails are kept in HD (`THUMB_MAX`, default 1280 px).
-
-## Auto Rename
-Set a format in `/us` -> Leech -> Leech Auto Rename. Placeholders:
-`{name} {year} {season} {episode} {quality} {resolution} {audio} {lib} {ott} {languages} {subtitles}
-{shortlang} {shortsub} {duration} {extension} {raw_name} {file_name} {file_caption}`
-
-- `{name}` never contains site tags like `[Toonworld4all]`.
-- `{resolution}` is plain `720p` / `1080p` (no bit depth).
-- `{shortlang}`: one audio = that language (`Hindi`), two = `Dual`, three or more = `Multi`.
-- Order applied to every file: Auto Rename -> underscores to spaces -> Remove / Replace -> Prefix / Suffix.
-  A name given with `-n` is always used exactly as typed.
-
-Caption variables: `{filename} {size} {duration} {resolution} {ext}` (safe HTML tags like `<b>` are allowed).
+Remove: `Love|Power|R:www\.example\.com[\s_-]*` (case-sensitive, `R:` = regex, `\|` = literal bar)
+Replace (one rule per line): `OLD|NEW|CASE|TIMES` e.g. `.| |0` / `Cinemas|` / `HD|FullHD|1|1`
+Caption variables: `{filename} {size} {duration} {quality} {languages} {subtitles} {md5_hash}`, `\s`, `\|`,
+and after the first `|` replacements `key:new_key:count`. Prefix / Suffix / Caption accept HTML tags.
+Auto Rename placeholders: `{name} {year} {season} {episode} {quality} {resolution} {audio} {lib} {ott}
+{languages} {subtitles} {shortlang} {shortsub} {duration} {extension} {raw_name} {file_name} {file_caption}`.
+Order applied to a file name: Auto Rename -> underscores to spaces -> Remove -> Replace -> Prefix / Suffix.
+A name given with `-n` is used exactly as typed.
 
 ## Deploy on Railway
-1. Push these files to GitHub (files at the repo root).
-2. Railway -> New Project -> Deploy from GitHub repo (the Dockerfile is detected automatically).
-3. Variables: `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID` (see `.env.example` for optional ones).
-4. Attach a Volume at `/data` so settings, thumbnails and the authorized list survive redeploys.
+1. Upload all files of this folder to the root of your GitHub repo (replace old ones, see the list in the chat).
+2. Railway -> Deploy from GitHub repo (the Dockerfile is detected).
+3. Variables: `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID` (the rest is optional).
+4. Attach a Volume with mount path `/data` so settings and thumbnails survive redeploys.
 
-## Upload speed
-- `wzgram` + WarpCrypto (Rust crypto) + uvloop.
-- Parallel uploader: `UPLOAD_SESSIONS` (default 8) x `UPLOAD_WORKERS` (default 4). If speed is not
-  better on your server, try 12 x 4; if you see flood errors, lower it. `FAST_UPLOAD=0` disables it.
-- If the fast path ever fails, the file is uploaded with the normal library uploader.
-- Real speed is limited by your server's network and Telegram's datacenter. Bots can upload max 2GB per
-  file; bigger files are split automatically.
+## Deploy on a VPS (Docker)
+```
+git clone <repo-url> bot
+cd bot
+cp config.envx config.env
+nano config.env          # fill API_ID, API_HASH, BOT_TOKEN, OWNER_ID ... then CTRL+O, ENTER, CTRL+X
+docker compose up -d --build && docker compose logs -f
+```
+Settings and thumbnails are kept in the Docker volume `data`. Update later:
+`git pull && docker compose up -d --build`. After editing `config.env` run the same `up -d --build`.

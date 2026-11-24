@@ -8,6 +8,7 @@ import asyncio
 import html
 import inspect
 import json
+import hashlib
 import logging
 import math
 import os
@@ -24,8 +25,10 @@ import yt_dlp
 
 import config as C
 import fastupload
+import limits
 import rename_utils as R
 import settings as S
+import statsui
 import utils as U
 from compat import (
     BLUE,
@@ -80,7 +83,14 @@ app = make_client()
 BOOT = time.time()
 SESSION: aiohttp.ClientSession = None
 BOT_USERNAME = ""
-SEM = asyncio.Semaphore(C.MAX_CONCURRENT)
+SUF = C.COMMAND_SUFFIX
+
+
+def cmds(*names):
+    """Command names with COMMAND_SUFFIX appended (/start is never suffixed)."""
+    return [n + SUF for n in names]
+
+
 TASKS = {}
 PENDING = {}
 STATUS = {}  # chat_id -> {"msg", "page", "text", "until", "reply_to"}
@@ -133,6 +143,11 @@ def authorized(m):
     return uid == C.OWNER_ID or uid in ids or m.chat.id in ids
 
 
+def can_use(uid, chat_id):
+    ids = C.AUTHORIZED_CHATS | AUTH
+    return uid == C.OWNER_ID or uid in ids or chat_id in ids
+
+
 def is_private(m):
     return m.chat.type == enums.ChatType.PRIVATE
 
@@ -140,6 +155,22 @@ def is_private(m):
 # ------------------------------------------------------------------ task model
 class Cancelled(Exception):
     pass
+
+
+class LimitError(RuntimeError):
+    pass
+
+
+def over_limit(t, total, key):
+    """Raise LimitError when a (non-owner) task is bigger than the engine limit or the leech limit."""
+    if t.owner or not total:
+        return
+    for k in (key, "leech"):
+        cap = limits.gb(k)
+        if cap and total > cap:
+            raise LimitError(
+                f"Size limit reached: {U.hsize(total)} is bigger than the {limits.DEFS[k][0]} ({limits.text(k)})."
+            )
 
 
 class Task:
@@ -163,7 +194,9 @@ class Task:
         self.thumb = None
         self.dests = dests
         self.dir = os.path.join(C.DOWNLOAD_DIR, self.id)
-        self.status = "Queued"
+        self.status = "Download"
+        self.capnames = {}
+        self.owner = user.id == C.OWNER_ID
         self.engine = "-"
         self.name = ""
         self.final_name = ""
@@ -196,14 +229,15 @@ def render(t):
         f"┠ <b>Engine</b> → {LIB_LABEL}\n"
         f"┠ <b>In Mode</b> → #{html.escape(t.engine)}\n"
         f"┠ <b>Out Mode</b> → #Leech\n"
-        f"┖ <b>Stop</b> → /c_{t.id}"
+        f"┖ <b>Stop</b> → /c{SUF}_{t.id}"
     )
 
 
 def stats_block(n=None):
     n = len(TASKS) if n is None else n
-    running = sum(1 for t in TASKS.values() if t.status != "Queued")
-    avail = max(C.MAX_CONCURRENT - running, 0)
+    running = len(TASKS)
+    cap = limits.get("bot_tasks")
+    avail = max(cap - running, 0) if cap else "∞"
     os.makedirs(C.DOWNLOAD_DIR, exist_ok=True)
     du = shutil.disk_usage(C.DOWNLOAD_DIR)
     net = psutil.net_io_counters()
@@ -249,10 +283,14 @@ def status_view(chat_id, page):
 
 
 async def ensure_status(chat_id, m):
-    """Make sure the chat has a live status message (called when a task starts)."""
+    """A new task always gets a fresh status message at the bottom (the old one is deleted)."""
     async with STATUS_LOCK:
-        if chat_id in STATUS:
-            return await refresh_status(chat_id, force=True)
+        old = STATUS.pop(chat_id, None)
+        if old:
+            try:
+                await old["msg"].delete()
+            except Exception:  # noqa: BLE001
+                pass
         view = status_view(chat_id, 0)
         if view is None:
             return
@@ -371,6 +409,14 @@ async def dl_aria(t):
         t.total = int(st["totalLength"])
         t.done = int(st["completedLength"])
         t.speed = int(st["downloadSpeed"])
+        try:
+            over_limit(t, t.total, "direct")
+        except LimitError:
+            try:
+                await rpc("aria2.remove", gid)
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         if st.get("files") and st["files"][0].get("path"):
             t.name = os.path.basename(st["files"][0]["path"])
         s = st["status"]
@@ -392,6 +438,7 @@ def ytdl_sync(t):
             t.done = d.get("downloaded_bytes", 0)
             t.speed = d.get("speed") or 0
             t.name = os.path.basename(d.get("filename", "")) or t.name
+            over_limit(t, t.total, "ytdlp")
 
     opts = {
         "outtmpl": f"{t.dir}/%(title).150B.%(ext)s",
@@ -434,12 +481,12 @@ async def download(t):
         try:
             await dl_aria(t)
             return
-        except Cancelled:
+        except (Cancelled, LimitError):
             raise
         except Exception as e1:  # noqa: BLE001
             try:
                 await dl_ytdlp(t)
-            except Cancelled:
+            except (Cancelled, LimitError):
                 raise
             except Exception:  # noqa: BLE001
                 raise RuntimeError(str(e1))
@@ -451,31 +498,76 @@ async def download(t):
 ARCH = (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".iso")
 
 
-async def extract(t):
-    for _ in range(2):  # 2 passes handle .tar.gz
-        found = False
-        for f in list_files(t.dir):
-            if f.lower().endswith(ARCH):
-                found = True
-                out = os.path.join(t.dir, "extracted")
-                rc, _, err = await run("7z", "x", f, f"-o{out}", "-y")
-                if rc != 0:
-                    raise RuntimeError("Extract failed: " + err[-200:])
-                os.remove(f)
-        if not found:
+def tick(t, done):
+    """Update processed bytes and a smoothed speed (used by extract / archive / split)."""
+    t.done = done
+    now = time.time()
+    if now - t._t >= 1:
+        t.speed = max((done - t._c) / (now - t._t), 0)
+        t._c, t._t = done, now
+
+
+async def run_7z(t, cmd, size, base=0, cwd=None):
+    """Run 7z with -bsp1 and turn its percentage output into task progress."""
+    p = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=cwd
+    )
+    tail = b""
+    while True:
+        chunk = await p.stdout.read(4096)
+        if not chunk:
             break
+        tail = (tail + chunk)[-2000:]
+        found = re.findall(rb"(\d{1,3})%", chunk)
+        if found:
+            tick(t, base + int(size * min(int(found[-1]), 100) / 100))
+        if t.cancel:
+            p.kill()
+            await p.wait()
+            raise Cancelled
+    rc = await p.wait()
+    return rc, tail.decode(errors="ignore")
+
+
+async def extract(t):
+    t.status = "Extract"
+    for _ in range(2):  # 2 passes handle .tar.gz
+        archives = [f for f in list_files(t.dir) if f.lower().endswith(ARCH)]
+        if not archives:
+            break
+        t.total = sum(os.path.getsize(f) for f in archives)
+        t.done = t.speed = t._c = 0
+        t._t = time.time()
+        base = 0
+        for f in archives:
+            if t.cancel:
+                raise Cancelled
+            size = os.path.getsize(f)
+            t.name = os.path.basename(f)
+            out = os.path.join(t.dir, "extracted")
+            rc, tail = await run_7z(t, ["7z", "x", f, f"-o{out}", "-y", "-bsp1"], size, base)
+            if rc != 0:
+                raise RuntimeError("Extract failed: " + tail[-200:])
+            os.remove(f)
+            base += size
+            t.done = base
     return list_files(t.dir)
 
 
 async def make_zip(t, files):
+    t.status = "Archive"
     base = t.new_name or (os.path.splitext(os.path.basename(files[0]))[0] if len(files) == 1 else (t.name or t.id))
     base = re.sub(r"\.zip$", "", base, flags=re.I)
     out_dir = t.dir + "_z"
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, base + ".zip")
-    rc, _, err = await run("7z", "a", "-tzip", "-mx=1", out, ".", cwd=t.dir)
+    total = sum(os.path.getsize(f) for f in files)
+    t.name, t.total = base + ".zip", total
+    t.done = t.speed = t._c = 0
+    t._t = time.time()
+    rc, tail = await run_7z(t, ["7z", "a", "-tzip", "-mx=1", "-bsp1", out, "."], total, 0, cwd=t.dir)
     if rc != 0:
-        raise RuntimeError("Zip failed: " + err[-200:])
+        raise RuntimeError("Zip failed: " + tail[-200:])
     shutil.rmtree(t.dir, ignore_errors=True)
     t.dir = out_dir
     return [out]
@@ -489,73 +581,102 @@ def rename_one(t, f):
     return new
 
 
-async def smart_names(files, s):
-    """Auto rename -> underscores to spaces -> remove / replace -> prefix / suffix."""
+async def smart_names(t, files, s):
+    """Auto rename -> underscores to spaces -> remove / replace -> prefix / suffix (+ caption name)."""
     out = []
     for f in files:
         d, n = os.path.split(f)
-        new = n
+        core = n
         if s["rename"]:
-            new = await R.auto_renamed(s["rename"], n, f)
-        new = U.tidy_name(new)
-        new = U.apply_rules(new, s)
-        if new != n:
-            dst = os.path.join(d, new)
+            core = await R.auto_renamed(s["rename"], n, f)
+        core = U.tidy_name(core)
+        core = U.clean_name(core, s)
+        final = U.affix_name(core, s)
+        if final != n:
+            dst = os.path.join(d, final)
             if not os.path.exists(dst):
                 os.rename(f, dst)
                 f = dst
+            else:
+                final = n
+        t.capnames[final] = U.caption_name(core, s)
         out.append(f)
     return out
+
+
+def cap_name_of(t, name):
+    """Caption version of a file name (keeps HTML from prefix / suffix). Split parts reuse their parent."""
+    if name in t.capnames:
+        return t.capnames[name]
+    for key, val in t.capnames.items():
+        if name.startswith(key):
+            return val + html.escape(name[len(key):])
+    return html.escape(name)
 
 
 def glob_escape(p):
     return re.sub(r"([\[\]\*\?])", r"[\1]", p)
 
 
-async def split_big(path, limit, equal=False):
+async def split_big(path, limit, equal=False, t=None):
     size = os.path.getsize(path)
     if size <= limit:
         return [path]
     chunk = limit
     if equal:  # equal sized parts instead of full parts + one small leftover
         chunk = math.ceil(size / math.ceil(size / limit))
-    rc, _, err = await run("split", "-b", str(chunk), "-d", "--numeric-suffixes=1", "-a", "3", path, path + ".")
-    if rc != 0:
-        raise RuntimeError("Split failed: " + err[-200:])
-    os.remove(path)
-    return sorted(glob(glob_escape(path) + ".[0-9][0-9][0-9]"))
+    pattern = glob_escape(path) + ".[0-9][0-9][0-9]"
+    if t:
+        t.status, t.name, t.total = "Split", os.path.basename(path), size
+        t.done = t.speed = t._c = 0
+        t._t = time.time()
 
+    async def poll():
+        while True:
+            await asyncio.sleep(1)
+            tick(t, sum(os.path.getsize(x) for x in glob(pattern)))
 
-async def probe(path):
-    rc, out, _ = await run(
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height:format=duration", "-of", "json", path,
-    )
+    poller = asyncio.ensure_future(poll()) if t else None
     try:
-        j = json.loads(out)
-        s = (j.get("streams") or [{}])[0]
-        return int(float(j["format"]["duration"])), int(s.get("width", 0)), int(s.get("height", 0))
-    except Exception:  # noqa: BLE001
-        return 0, 0, 0
+        p = await asyncio.create_subprocess_exec(
+            "split", "-b", str(chunk), "-d", "--numeric-suffixes=1", "-a", "3", path, path + ".",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await p.communicate()
+    finally:
+        if poller:
+            poller.cancel()
+    if p.returncode != 0:
+        raise RuntimeError("Split failed: " + err.decode(errors="ignore")[-200:])
+    os.remove(path)
+    return sorted(glob(pattern))
 
 
-async def video_thumb(path, dur, tid):
-    """HD cover frame taken from the middle of the video (longest side C.THUMB_MAX)."""
-    out = os.path.join(C.DOWNLOAD_DIR, f"{tid}_th.jpg")
+async def make_covers(path, dur, tag):
+    """HD frame from the middle of a video -> (thumbnail under 200 KB, big HD cover)."""
+    cover = os.path.join(C.DOWNLOAD_DIR, f"{tag}_cv.jpg")
     m = C.THUMB_MAX
     vf = f"scale='if(gt(iw,ih),min({m},iw),-2)':'if(gt(iw,ih),-2,min({m},ih))'"
     rc, _, _ = await run(
-        "ffmpeg", "-y", "-ss", str(max(dur // 2, 0)), "-i", path, "-frames:v", "1", "-vf", vf, "-q:v", "3", out
+        "ffmpeg", "-y", "-ss", str(max(dur // 2, 0)), "-i", path, "-frames:v", "1", "-vf", vf, "-q:v", "3", cover
     )
-    return out if rc == 0 and os.path.exists(out) else None
+    if rc != 0 or not os.path.exists(cover):
+        return None, None
+    thumb = os.path.join(C.DOWNLOAD_DIR, f"{tag}_th.jpg")
+    try:
+        await asyncio.to_thread(S.prep_thumb, cover, thumb)
+    except Exception as e:  # noqa: BLE001
+        log.warning("thumbnail processing failed: %r", e)
+        return cover, cover
+    return thumb, cover
 
 
-async def make_shots(t, path, dur, n):
+async def make_shots(t, path, dur, n, tag):
     outs = []
     if n <= 0 or dur < 10:
         return outs
     for i in range(1, n + 1):
-        out = os.path.join(C.DOWNLOAD_DIR, f"{t.id}_ss{i}.jpg")
+        out = os.path.join(C.DOWNLOAD_DIR, f"{t.id}_{tag}_ss{i}.jpg")
         rc, _, _ = await run(
             "ffmpeg", "-y", "-ss", str(int(dur * i / (n + 1))), "-i", path,
             "-frames:v", "1", "-vf", "scale=1280:-2", "-q:v", "3", out,
@@ -581,19 +702,6 @@ async def fetch_thumb(t):
 
 
 # ------------------------------------------------------------------ upload
-def make_progress(t):
-    async def prog(cur, total):
-        if t.cancel:
-            app.stop_transmission()
-        now = time.time()
-        t.done = cur
-        if now - t._t >= 1:
-            t.speed = (cur - t._c) / (now - t._t)
-            t._c, t._t = cur, now
-
-    return prog
-
-
 async def copy_to(sent, chat_id, rk):
     try:
         return await sent.copy(chat_id, **rk)
@@ -649,19 +757,34 @@ async def mediainfo_markup(path):
     return KB([[B("📄 MediaInfo", url=link)]]) if link else None
 
 
+def md5_of(path):
+    h = hashlib.md5()
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+VIDEO_PARAMS = set(inspect.signature(app.send_video).parameters)
+COVER_OK = C.USE_COVER and "cover" in VIDEO_PARAMS
+
+
 async def send_file(t, f, s, thumb, prog):
     """Upload one file to the first destination, then copy it (instantly) to the others."""
     name = os.path.basename(f)
     size = os.path.getsize(f)
     kind = U.media_kind(f)
+    tag = secrets.token_hex(3)
     primary = t.dests[0]
     in_group = lambda cid: cid == t.chat_id and not t.private  # noqa: E731
     rk = reply_kwargs(t.cmd.id) if in_group(primary) else {}
     is_video = kind == "video"
-    dur = w = h = 0
-    if kind in ("video", "audio"):
-        dur, w, h = await probe(f)
-    caption = U.render_caption(s, name, size, dur, w, h)
+    info = await R.probe_info(f) if kind in ("video", "audio") else {}
+    dur, w, h = info.get("duration", 0), info.get("width", 0), info.get("height", 0)
+    md5 = ""
+    if re.search(r"\{md5_hash\}", s["caption"] or "", re.I):
+        md5 = await asyncio.to_thread(md5_of, f)
+    caption = U.render_caption(s, cap_name_of(t, name), size, info, md5)
     kw = dict(chat_id=primary, caption=caption, progress=prog, **rk)
     if s["mediainfo"] and kind in ("video", "audio"):
         markup = await mediainfo_markup(f)
@@ -669,11 +792,14 @@ async def send_file(t, f, s, thumb, prog):
             kw["reply_markup"] = markup
 
     # HD cover: -t link / your thumbnail first, otherwise a frame taken from the video itself
-    cover = thumb or (await video_thumb(f, dur, t.id) if is_video else None)
+    th = cv = thumb
+    if is_video and not thumb:
+        th, cv = await make_covers(f, dur, f"{t.id}_{tag}")
     if not s["as_doc"] and is_video:
+        extra_kw = {"cover": cv} if (COVER_OK and cv) else {}
         sent = await app.send_video(
-            video=f, duration=dur, width=w, height=h, thumb=cover, supports_streaming=True,
-            **with_name(app.send_video, name), **kw,
+            video=f, duration=dur, width=w, height=h, thumb=th, supports_streaming=True,
+            **extra_kw, **with_name(app.send_video, name), **kw,
         )
     elif not s["as_doc"] and kind == "audio":
         sent = await app.send_audio(
@@ -683,7 +809,7 @@ async def send_file(t, f, s, thumb, prog):
         sent = await app.send_photo(photo=f, **kw)
     else:
         sent = await app.send_document(
-            document=f, thumb=cover, force_document=True, **with_name(app.send_document, name), **kw
+            document=f, thumb=th, force_document=True, **with_name(app.send_document, name), **kw
         )
 
     delivered = [(name, sent)]
@@ -694,12 +820,12 @@ async def send_file(t, f, s, thumb, prog):
             log.warning("copy to %s failed: %r", extra, e)
 
     if is_video and s["shots"] and not t.cancel:
-        await send_shots(t, f, dur, s["shots"], rk)
+        await send_shots(t, f, dur, s["shots"], rk, tag)
     return delivered
 
 
-async def send_shots(t, f, dur, n, rk):
-    shots = await make_shots(t, f, dur, n)
+async def send_shots(t, f, dur, n, rk, tag):
+    shots = await make_shots(t, f, dur, n, tag)
     if not shots:
         return
     try:
@@ -714,19 +840,49 @@ async def send_shots(t, f, dur, n, rk):
 
 
 async def upload_all(t, files, s):
+    """Upload every file. The status shows ONE overall progress for all files together."""
     thumb = t.thumb or S.thumb_of(t.uid)
-    prog = make_progress(t)
-    delivered = []
-    for i, f in enumerate(files, 1):
-        if t.cancel:
-            raise Cancelled
-        t.name = os.path.basename(f)
-        t.total = os.path.getsize(f)
-        t.done = t.speed = t._c = 0
-        t._t = time.time()
-        t.status = f"Upload ({i}/{len(files)})" if len(files) > 1 else "Upload"
-        delivered += await send_file(t, f, s, thumb, prog)
-    return delivered
+    sizes = [os.path.getsize(f) for f in files]
+    n = len(files)
+    t.total, t.done, t.speed, t._c = sum(sizes), 0, 0, 0
+    t._t = time.time()
+    t.status = f"Upload (0/{n})" if n > 1 else "Upload"
+    part = {}
+    finished = 0
+    sem = asyncio.Semaphore(max(1, limits.get("parallel")))  # 1 = strict order (episodes stay in order)
+
+    def make_prog(i):
+        async def prog(cur, total):
+            if t.cancel:
+                app.stop_transmission()
+            part[i] = cur
+            tick(t, sum(part.values()))
+
+        return prog
+
+    async def one(i, f):
+        nonlocal finished
+        async with sem:
+            if t.cancel:
+                raise Cancelled
+            t.name = os.path.basename(f)
+            res = await send_file(t, f, s, thumb, make_prog(i))
+            part[i] = sizes[i]
+            finished += 1
+            if n > 1:
+                t.status = f"Upload ({finished}/{n})"
+            tick(t, sum(part.values()))
+            return res
+
+    jobs = [asyncio.ensure_future(one(i, f)) for i, f in enumerate(files)]
+    try:
+        results = await asyncio.gather(*jobs)
+    except BaseException:
+        for j in jobs:
+            j.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        raise
+    return [d for r in results for d in r]
 
 
 # ------------------------------------------------------------------ task runner
@@ -782,47 +938,43 @@ async def finish_ok(t, files, delivered):
 async def run_task(t):
     s = S.get(t.uid)
     try:
-        async with SEM:
-            if t.cancel:
-                raise Cancelled
-            os.makedirs(t.dir, exist_ok=True)
-            if t.thumb_link:
-                await fetch_thumb(t)
-            t.status = "Download"
-            await download(t)
-            if t.cancel:
-                raise Cancelled
-            t.speed = 0
-            files = list_files(t.dir)
-            if not files:
-                raise RuntimeError("Nothing was downloaded")
-            if not t.name:
-                t.name = os.path.basename(files[0])
-            if t.extract:
-                t.status = "Extract"
-                files = await extract(t)
-            if t.zip:
-                t.status = "Archive"
-                files = await make_zip(t, files)
-            elif t.new_name and len(files) == 1:
-                files = [rename_one(t, files[0])]
-            if not t.new_name:
-                files = await smart_names(files, s)
-            t.status = "Split"
-            limit = S.split_limit(s)
-            final = []
-            for f in files:
-                final += await split_big(f, limit, s["equal"])
-            t.final_name = os.path.basename(final[0]) if len(final) == 1 else t.name
-            delivered = await upload_all(t, final, s)
-            await finish_ok(t, final, delivered)
+        os.makedirs(t.dir, exist_ok=True)
+        if t.thumb_link:
+            await fetch_thumb(t)
+        t.status = "Download"
+        await download(t)
+        if t.cancel:
+            raise Cancelled
+        t.speed = 0
+        files = list_files(t.dir)
+        if not files:
+            raise RuntimeError("Nothing was downloaded")
+        over_limit(t, sum(os.path.getsize(f) for f in files), "leech")
+        if not t.name:
+            t.name = os.path.basename(files[0])
+        if t.extract:
+            files = await extract(t)
+        if t.zip:
+            files = await make_zip(t, files)
+        elif t.new_name and len(files) == 1:
+            files = [rename_one(t, files[0])]
+        if not t.new_name:
+            files = await smart_names(t, files, s)
+        limit = S.split_limit(s)
+        final = []
+        for f in files:
+            final += await split_big(f, limit, s["equal"], t)
+        t.final_name = os.path.basename(final[0]) if len(final) == 1 else t.name
+        delivered = await upload_all(t, final, s)
+        await finish_ok(t, final, delivered)
     except Cancelled:
         await notify(t, f"❌ <b>Task cancelled.</b> ({t.mention})")
     except Exception as e:  # noqa: BLE001
         if t.cancel:
             await notify(t, f"❌ <b>Task cancelled.</b> ({t.mention})")
         else:
-            log.exception("task failed")
+            if not isinstance(e, LimitError):
+                log.exception("task failed")
             await notify(t, f"❌ <b>Task Failed</b> ({t.mention})\n<code>{html.escape(str(e)[:500])}</code>")
     finally:
         t.finished = True
@@ -871,43 +1023,48 @@ def parse(tokens):
     return link, z, e, name, thumb
 
 
+def _c(name, short=None):
+    return f"/{name}{SUF}" + (f" or /{short}{SUF}" if short else "")
+
+
 HELP = (
     "<b>📥 Leech Bot — Commands</b>\n"
     "<i>Every command has a short form.</i>\n\n"
-    "┌ /leech or /l — leech a link to Telegram\n"
-    "├ /usetting or /us — your personal settings\n"
-    "├ /status or /s — live status of running tasks\n"
-    "├ /cancel or /c — cancel a task (<code>/c_ID</code> works too)\n"
-    "├ /cancelall or /ca — cancel all your tasks\n"
-    "├ /stats or /st — bot &amp; server stats\n"
-    "├ /ping — check response time\n"
-    "└ /help or /h — this message\n\n"
+    f"┌ {_c('leech', 'l')} — leech a link to Telegram\n"
+    f"├ {_c('usetting', 'us')} — your personal settings\n"
+    f"├ {_c('status', 's')} — live status of running tasks\n"
+    f"├ {_c('cancel', 'c')} — cancel a task (<code>/c{SUF}_ID</code> works too)\n"
+    f"├ {_c('cancelall', 'ca')} — cancel all your tasks\n"
+    f"├ {_c('stats', 'st')} — bot &amp; server stats\n"
+    f"├ /ping{SUF} — check response time\n"
+    f"└ {_c('help', 'h')} — this message\n\n"
     "<b>Owner only</b>\n"
-    "┌ /authorize or /a — authorize a user / group\n"
-    "└ /unauthorize or /ua — remove authorization\n\n"
+    f"┌ {_c('botsettings', 'bs')} — bot limits (user tasks, bot tasks, leech limit ...)\n"
+    f"├ {_c('authorize', 'a')} — authorize a user / group\n"
+    f"└ {_c('unauthorize', 'ua')} — remove authorization\n\n"
     "<b>Leech arguments</b>\n"
     "┌ <code>-z</code> zip the files\n"
     "├ <code>-e</code> extract archives\n"
     "├ <code>-n</code> new file name\n"
     "└ <code>-t</code> thumbnail link\n\n"
     "<b>Examples</b>\n"
-    "<code>/l https://site.com/movie.mkv</code>\n"
-    "<code>/l https://site.com/movie.mkv -n My Movie.mkv -t https://site.com/t.jpg</code>\n"
-    "<code>/l https://site.com/a.zip -e</code>\n\n"
+    f"<code>/l{SUF} https://site.com/movie.mkv</code>\n"
+    f"<code>/l{SUF} https://site.com/movie.mkv -n My Movie.mkv -t https://site.com/t.jpg</code>\n"
+    f"<code>/l{SUF} https://site.com/a.zip -e</code>\n\n"
     "<i>Leech inside a group and the files always arrive in your bot PM.</i>"
 )
-
 USER_COMMANDS = [
     ("leech", "Leech a link to Telegram • short: /l"),
     ("usetting", "Open your settings • short: /us"),
     ("status", "Live task status • short: /s"),
-    ("cancel", "Cancel a task • short: /c (also /c_ID)"),
+    ("cancel", "Cancel a task • short: /c"),
     ("cancelall", "Cancel all your tasks • short: /ca"),
     ("stats", "Bot & server stats • short: /st"),
     ("ping", "Check bot response time"),
     ("help", "Show all commands • short: /h"),
 ]
 OWNER_COMMANDS = USER_COMMANDS + [
+    ("botsettings", "Bot limits (owner) • short: /bs"),
     ("authorize", "Authorize a user or group • short: /a"),
     ("unauthorize", "Remove authorization • short: /ua"),
 ]
@@ -915,15 +1072,18 @@ OWNER_COMMANDS = USER_COMMANDS + [
 
 async def setup_commands():
     """Register the command menu automatically on every start - no BotFather setup needed."""
+    def menu(items):
+        return [types.BotCommand(c + SUF, d) for c, d in items]
+
     try:
-        await app.set_bot_commands([types.BotCommand(c, d) for c, d in USER_COMMANDS])
+        await app.set_bot_commands([types.BotCommand("start", "Start the bot")] + menu(USER_COMMANDS))
         log.info("Bot commands registered")
     except Exception as e:  # noqa: BLE001
         log.warning("Could not register bot commands: %r", e)
     if C.OWNER_ID:
         try:
             await app.set_bot_commands(
-                [types.BotCommand(c, d) for c, d in OWNER_COMMANDS],
+                [types.BotCommand("start", "Start the bot")] + menu(OWNER_COMMANDS),
                 scope=types.BotCommandScopeChat(chat_id=C.OWNER_ID),
             )
         except Exception as e:  # noqa: BLE001 - owner has not started the bot yet
@@ -931,36 +1091,143 @@ async def setup_commands():
 
 
 # ------------------------------------------------------------------ handlers: basics
-@app.on_message(filters.command(["start", "help", "h"]))
+def start_rows():
+    """Buttons from ST_BUTTON_1 / ST_BUTTON_2 ("TEXT:URL")."""
+    row = []
+    for raw in (C.ST_BUTTON_1, C.ST_BUTTON_2):
+        label, sep, url = (raw or "").partition(":")
+        label, url = label.strip(), url.strip()
+        if sep and label and url.startswith(("http://", "https://", "tg://")):
+            row.append(B(label, url=url, style=GREEN))
+    return [row] if row else None
+
+
+@app.on_message(filters.command("start"))
 async def start_cmd(_, m):
-    await reply(m, HELP)
+    """The only command everybody can use."""
+    await reply(m, C.ST_TEXT, start_rows())
 
 
-@app.on_message(filters.command("ping"))
+@app.on_message(filters.command(cmds("help", "h")))
+async def help_cmd(_, m):
+    if authorized(m):
+        await reply(m, HELP)
+
+
+@app.on_message(filters.command(cmds("ping")))
 async def ping_cmd(_, m):
+    if not authorized(m):
+        return
     t0 = time.time()
     msg = await reply(m, "🏓 Pinging...")
     await edit(msg, f"🏓 <b>Pong!</b> <code>{(time.time() - t0) * 1000:.0f} ms</code>")
 
 
-@app.on_message(filters.command(["stats", "st"]))
+# ------------------------------------------------------------------ handlers: /stats
+def uploader_line():
+    if not C.FAST_UPLOAD:
+        return "Library default"
+    return (
+        f"Fast ({C.UPLOAD_SESSIONS}x{C.UPLOAD_WORKERS}) · done {fastupload.STATS['fast']}"
+        f" / fallback {fastupload.STATS['fallback']}"
+    )
+
+
+STATS_HOME = "<b><i>⌬ Bot &amp; OS Statistics!</i></b>"
+
+
+def stats_rows(view):
+    if view == "main":
+        return [
+            [B("Bot Stats", "sx|bot", GREEN), B("OS Stats", "sx|os", GREEN)],
+            [B("Repo Stats", "sx|repo", GREEN), B("Bot Limits", "sx|limits", GREEN)],
+            [B("Close", "sx|close", RED)],
+        ]
+    return [[B("Back", "sx|main", RED), B("Close", "sx|close", RED)]]
+
+
+@app.on_message(filters.command(cmds("stats", "st")))
 async def stats_cmd(_, m):
-    du = shutil.disk_usage(C.DOWNLOAD_DIR if os.path.isdir(C.DOWNLOAD_DIR) else "/")
-    uploader = (
-        f"Fast ({C.UPLOAD_SESSIONS}x{C.UPLOAD_WORKERS}) · done {fastupload.STATS['fast']} / fallback {fastupload.STATS['fallback']}"
-        if C.FAST_UPLOAD
-        else "Library default"
-    )
-    text = (
-        stats_block()
-        + "\n\n<b>⌬ System</b>\n"
-        f"┟ <b>Disk</b> → {U.hsize(du.used)} / {U.hsize(du.total)}\n"
-        f"┠ <b>Library</b> → {LIB_LABEL}\n"
-        f"┠ <b>Python</b> → {sys.version.split()[0]}\n"
-        f"┠ <b>Uploader</b> → {uploader}\n"
-        f"┖ <b>Settings Storage</b> → {'Persistent ✅' if S.PERSISTENT else 'Not persistent ⚠️ (attach a Volume)'}"
-    )
-    await reply(m, text)
+    if authorized(m):
+        await reply(m, STATS_HOME, stats_rows("main"))
+
+
+@app.on_callback_query(filters.regex(r"^sx\|"))
+async def stats_cb(_, q):
+    if not can_use(q.from_user.id, q.message.chat.id):
+        return await q.answer("You are not allowed to use this.", show_alert=True)
+    view = q.data.split("|")[1]
+    if view == "close":
+        try:
+            await q.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        return await q.answer()
+    if view == "bot":
+        text = statsui.bot_stats(BOOT, uploader_line())
+    elif view == "os":
+        text = statsui.os_stats()
+    elif view == "repo":
+        text = await statsui.repo_stats(SESSION)
+    elif view == "limits":
+        text = statsui.limits_text(len(TASKS))
+    else:
+        view, text = "main", STATS_HOME
+    await edit(q.message, text, stats_rows(view))
+    await q.answer()
+
+
+# ------------------------------------------------------------------ handlers: /botsettings (owner only)
+def bs_panel():
+    keys = list(limits.DEFS)
+    lines = ["<b><u>☰ Bot Settings :</u></b>\n"]
+    for i, k in enumerate(keys):
+        sym = "┌" if i == 0 else ("└" if i == len(keys) - 1 else "├")
+        lines.append(f"{sym} <b>{limits.DEFS[k][0]}</b> : {limits.text(k)}")
+    lines.append("\n<i>0 = unlimited. The owner is never limited. Changes apply instantly.</i>")
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([B(limits.DEFS[k][0], f"bs|ask|{k}", GREEN) for k in keys[i : i + 2]])
+    rows.append([B("Close", "bs|close", RED)])
+    return "\n".join(lines), rows
+
+
+@app.on_message(filters.command(cmds("botsettings", "bs")))
+async def botsettings_cmd(_, m):
+    if m.from_user and m.from_user.id == C.OWNER_ID:
+        text, rows = bs_panel()
+        await reply(m, text, rows)
+
+
+@app.on_callback_query(filters.regex(r"^bs\|"))
+async def bs_cb(_, q):
+    if q.from_user.id != C.OWNER_ID:
+        return await q.answer("Only the owner can use this.", show_alert=True)
+    PENDING.pop(q.from_user.id, None)
+    p = q.data.split("|")
+    if p[1] == "close":
+        try:
+            await q.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        return await q.answer()
+    if p[1] == "ask":
+        key = p[2]
+        pend = {"kind": "bs:" + key, "msg": q.message, "chat": q.message.chat.id, "timeout": 60,
+                "exp": time.time() + 60, "user": q.from_user}
+        PENDING[q.from_user.id] = pend
+        label = limits.DEFS[key][0]
+        await edit(
+            q.message,
+            f"<b><u>☰ {label} :</u></b>\n\n➲ <b>Current</b> : {limits.text(key)}\n\n"
+            "Send a number (<code>0</code> = unlimited).\n<b>Timeout:</b> <code>60 sec</code>",
+            [[B("Stop Change", "bs|go", RED)], [B("Close", "bs|close", RED)]],
+        )
+        spawn(expire_prompt(q.from_user.id, pend))
+        return await q.answer()
+    text, rows = bs_panel()
+    await edit(q.message, text, rows)
+    await q.answer()
 
 
 # ------------------------------------------------------------------ handlers: leech
@@ -985,10 +1252,10 @@ def pick_dests(m, s):
     return [m.chat.id] if is_private(m) else [m.from_user.id]
 
 
-@app.on_message(filters.command(["leech", "l"]))
+@app.on_message(filters.command(cmds("leech", "l")))
 async def leech_cmd(_, m):
     if not authorized(m):
-        return await reply(m, "❌ You are not authorized to use this bot.")
+        return
     if not m.from_user:
         return await reply(m, "❌ Anonymous admins cannot use this command.")
     tokens = (m.text or "").split()[1:]
@@ -1001,8 +1268,14 @@ async def leech_cmd(_, m):
         return await reply(m, "❌ Torrent / magnet links are not supported.")
 
     uid = m.from_user.id
-    if C.DAILY_TASK_LIMIT and uid != C.OWNER_ID and S.daily_used(uid) >= C.DAILY_TASK_LIMIT:
-        return await reply(m, f"❌ Daily task limit reached ({C.DAILY_TASK_LIMIT} per day). Try again tomorrow.")
+    if uid != C.OWNER_ID:  # the owner has no limits at all
+        daily, per_user, per_bot = limits.get("daily"), limits.get("user_tasks"), limits.get("bot_tasks")
+        if daily and S.daily_used(uid) >= daily:
+            return await reply(m, f"❌ Daily task limit reached ({daily} per day). Try again tomorrow.")
+        if per_user and sum(1 for x in TASKS.values() if x.uid == uid) >= per_user:
+            return await reply(m, f"❌ You already have {per_user} running task(s). Wait for one to finish.")
+        if per_bot and len(TASKS) >= per_bot:
+            return await reply(m, f"❌ The bot is busy ({per_bot} tasks running). Try again in a moment.")
 
     s = S.get(uid)
     dests = pick_dests(m, s)
@@ -1022,8 +1295,10 @@ async def leech_cmd(_, m):
 
 
 # ------------------------------------------------------------------ handlers: status & cancel
-@app.on_message(filters.command(["status", "s"]))
+@app.on_message(filters.command(cmds("status", "s")))
 async def status_cmd(_, m):
+    if not authorized(m):
+        return
     chat_id = m.chat.id
     view = status_view(chat_id, 0)
     if view is None:
@@ -1076,9 +1351,9 @@ async def do_cancel(uid, tid):
     return f"🛑 Cancelling task <code>{t.id}</code> ..."
 
 
-@app.on_message(filters.command(["cancel", "c"]))
+@app.on_message(filters.command(cmds("cancel", "c")))
 async def cancel_cmd(_, m):
-    if not m.from_user:
+    if not m.from_user or not authorized(m):
         return
     uid = m.from_user.id
     args = (m.text or "").split()[1:]
@@ -1089,20 +1364,20 @@ async def cancel_cmd(_, m):
         return await reply(m, "You have no running tasks.")
     if len(mine) == 1:
         return await reply(m, await do_cancel(uid, mine[0].id))
-    lines = "\n".join(f"/c_{t.id} — <code>{html.escape(U.shorten(t.name or t.link, 40))}</code>" for t in mine)
+    lines = "\n".join(f"/c{SUF}_{t.id} — <code>{html.escape(U.shorten(t.name or t.link, 40))}</code>" for t in mine)
     await reply(m, "You have several tasks. Tap the one to cancel:\n\n" + lines)
 
 
-@app.on_message(filters.regex(r"^/(?:cancel|c)_(\w+)"))
+@app.on_message(filters.regex(rf"^/(?:cancel|c){SUF}_(\w+)"))
 async def cancel_msg(_, m):
-    if not m.from_user:
+    if not m.from_user or not authorized(m):
         return
     await reply(m, await do_cancel(m.from_user.id, m.matches[0].group(1)))
 
 
-@app.on_message(filters.command(["cancelall", "ca"]))
+@app.on_message(filters.command(cmds("cancelall", "ca")))
 async def cancelall_cmd(_, m):
-    if not m.from_user:
+    if not m.from_user or not authorized(m):
         return
     uid = m.from_user.id
     n = 0
@@ -1142,7 +1417,7 @@ AUTH_USAGE = (
 )
 
 
-@app.on_message(filters.command(["authorize", "a"]))
+@app.on_message(filters.command(cmds("authorize", "a")))
 async def auth_cmd(_, m):
     if not m.from_user or m.from_user.id != C.OWNER_ID:
         return
@@ -1156,7 +1431,7 @@ async def auth_cmd(_, m):
     await reply(m, f"✅ <code>{tid}</code> authorized.")
 
 
-@app.on_message(filters.command(["unauthorize", "ua"]))
+@app.on_message(filters.command(cmds("unauthorize", "ua")))
 async def unauth_cmd(_, m):
     if not m.from_user or m.from_user.id != C.OWNER_ID:
         return
@@ -1188,10 +1463,10 @@ async def save_thumb_from(m, uid):
             os.remove(raw)
 
 
-@app.on_message(filters.command(["usetting", "us"]))
+@app.on_message(filters.command(cmds("usetting", "us")))
 async def usetting_cmd(_, m):
     if not authorized(m):
-        return await reply(m, "❌ You are not authorized to use this bot.")
+        return
     if not m.from_user:
         return
     uid = m.from_user.id
@@ -1215,16 +1490,16 @@ async def usetting_cmd(_, m):
     await reply(m, text, rows)
 
 
-PROMPT_TIMEOUT = 60
-
-
 async def expire_prompt(uid, p):
     """After the timeout the prompt turns back into the menu (like WZML-X)."""
-    await asyncio.sleep(PROMPT_TIMEOUT)
+    await asyncio.sleep(p["timeout"])
     if PENDING.get(uid) is p:
         PENDING.pop(uid, None)
         try:
-            text, rows = S.panel(uid, "m_" + p["kind"], p["user"])
+            if p["kind"].startswith("bs:"):
+                text, rows = bs_panel()
+            else:
+                text, rows = S.panel(uid, "m_" + p["kind"], p["user"])
             await edit(p["msg"], text, rows)
         except Exception:  # noqa: BLE001
             pass
@@ -1278,7 +1553,9 @@ async def us_cb(_, q):
         note = "All settings were reset"
     elif act == "ask":
         kind = args[0]
-        pend = {"kind": kind, "msg": msg, "chat": msg.chat.id, "exp": time.time() + PROMPT_TIMEOUT, "user": q.from_user}
+        wait = S.timeout_of(kind)
+        pend = {"kind": kind, "msg": msg, "chat": msg.chat.id, "timeout": wait, "exp": time.time() + wait,
+                "user": q.from_user}
         PENDING[uid] = pend
         await edit(msg, S.prompt_text(uid, kind), S.prompt_rows(uid, kind))
         spawn(expire_prompt(uid, pend))
@@ -1306,6 +1583,23 @@ async def pending_h(_, m):
     uid = m.from_user.id
     p = PENDING.pop(uid)
     kind = p["kind"]
+    if kind.startswith("bs:"):  # owner: /botsettings value
+        key = kind[3:]
+        raw = (m.text or "").strip().replace(",", ".")
+        try:
+            value = float(raw)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            PENDING[uid] = p
+            return await reply(m, "❌ Send a number, e.g. <code>2</code> (0 = unlimited).")
+        limits.put(key, value)
+        try:
+            await m.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        text, rows = bs_panel()
+        return await edit(p["msg"], text, rows)
     if kind == "thumb":
         if is_image_msg(m):
             await save_thumb_from(m, uid)

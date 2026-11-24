@@ -13,9 +13,10 @@ from pathlib import Path
 from PIL import Image
 
 import config as C
+import limits
 import rename_utils
 from compat import GREEN, RED, B
-from utils import FONTS, hsize, htime, parse_pairs, parse_size, parse_words
+from utils import FONTS, hsize, htime, parse_pairs, parse_remove, parse_replace, parse_size, parse_words
 
 log = logging.getLogger("leechbot.settings")
 
@@ -115,16 +116,20 @@ def delete_thumb(uid):
         p.unlink()
 
 
-def prep_thumb(src, dst):
-    """Save an image as an HD JPEG thumbnail (longest side C.THUMB_MAX)."""
+def prep_thumb(src, dst, max_bytes=200 * 1024):
+    """Save an image as a JPEG thumbnail: as big as possible (up to C.THUMB_MAX) but under 200 KB."""
     im = Image.open(src).convert("RGB")
-    im.thumbnail((C.THUMB_MAX, C.THUMB_MAX))
-    quality = 92
+    side = C.THUMB_MAX
     while True:
-        im.save(dst, "JPEG", quality=quality, optimize=True)
-        if quality <= 70 or os.path.getsize(dst) <= 300 * 1024:
-            break
-        quality -= 8
+        small = im.copy()
+        small.thumbnail((side, side))
+        for quality in (92, 85, 78, 70, 62):
+            small.save(dst, "JPEG", quality=quality, optimize=True)
+            if os.path.getsize(dst) <= max_bytes:
+                return
+        if side <= 320:
+            return
+        side = max(320, int(side * 0.8))
 
 
 def rclone_of(uid):
@@ -214,6 +219,14 @@ def _tail(uid, back):
 
 # ----------------------------------------------------------------- generic option menus
 RENAME_GUIDE = rename_utils.TEMPLATE_GUIDE_URL
+CAPTION_GUIDE = "https://t.me/c/4291361651/33"
+DEFAULT_TIMEOUT = 60
+
+
+def timeout_of(kind):
+    return MENUS[kind].get("timeout", DEFAULT_TIMEOUT)
+
+
 MENUS = {
     "thumb": {
         "title": "Thumbnail Settings", "label": "Custom Thumbnail", "set": "Set Thumbnail", "back": "leech",
@@ -224,27 +237,36 @@ MENUS = {
         "title": "Caption Settings", "label": "Leech Filename Caption", "set": "Set Caption", "back": "leech",
         "desc": "Leech Caption is the Custom Caption on the Leech Files Uploaded by the bot",
         "ask": "Send Leech Caption. You can add HTML tags.\n"
-        "Variables : <code>{filename} {size} {duration} {resolution} {ext}</code>",
+        f'Documentation Here : <a href="{CAPTION_GUIDE}">Click Here</a>',
     },
     "prefix": {
         "title": "Prefix Settings", "label": "Leech Prefix", "set": "Set Prefix", "back": "leech",
         "desc": "Text added before the name of every leeched file",
-        "ask": "Send the prefix. Use <code>\\s</code> for a space at the end.\nExample: <code>[MySite]\\s</code>",
+        "ask": "Send the prefix. It supports HTML tags.\nUse <code>\\s</code> to add a space after it.\n"
+        "Example: <code>@channel_name\\s</code>",
     },
     "suffix": {
         "title": "Suffix Settings", "label": "Leech Suffix", "set": "Set Suffix", "back": "leech",
         "desc": "Text added after the name of every leeched file (before the extension)",
-        "ask": "Send the suffix. Use <code>\\s</code> for a space at the start.\nExample: <code>\\s@MyChannel</code>",
+        "ask": "Send the suffix. It supports HTML tags.\nUse <code>\\s</code> to add a space before it.\n"
+        "Example: <code>\\s@channel_name</code>",
     },
     "remove": {
-        "title": "Remove Settings", "label": "Leech Remove", "set": "Set Remove Words", "back": "leech",
-        "desc": "Words that are removed from the name of every leeched file",
-        "ask": "Send words to remove, separated by commas.\n<code>www.site.com, [Group], 1080p</code>",
+        "title": "Remove Settings", "label": "Remove", "set": "Set Remove", "back": "leech", "timeout": 120,
+        "desc": "Remove exact words or regex patterns from leeched filenames. Rules are case-sensitive "
+        "and the file extension is protected.",
+        "ask": "Send Remove rules separated by <code>|</code>.\n"
+        "Example: <code>Love|Power|R:www\\.example\\.com[\\s_-]*</code>\n"
+        "Regex rules must start with <code>R:</code>. Use <code>\\|</code> for regex alternation.",
     },
     "replace": {
-        "title": "Replace Settings", "label": "Leech Replace", "set": "Set Replace Pairs", "back": "leech",
-        "desc": "Words that are replaced in the name of every leeched file",
-        "ask": "Send <code>old:new</code> pairs separated by commas.\n<code>WEB-DL:WEBDL, Ep:E</code>",
+        "title": "Replace Settings", "label": "Replace", "set": "Set Replace", "back": "leech", "timeout": 120,
+        "desc": "Find, replace, or delete text in leeched filenames. Rules run top to bottom and the file "
+        "extension is protected.",
+        "ask": "Send one Replace rule per line.\n<code>OLD|NEW|CASE|TIMES</code>\n\n"
+        "<b>CASE:</b> 0 = insensitive (default), 1/I = sensitive\n"
+        "<b>TIMES:</b> 0 = all (default), or a positive number\n\n<b>Examples:</b>\n"
+        "<code>.| |0\nCinemas|\nHD|FullHD|1|1</code>",
     },
     "rename": {
         "title": "Auto Rename Settings", "label": "Leech Auto Rename", "set": "Set Auto Rename", "back": "leech",
@@ -303,7 +325,7 @@ def prompt_text(uid, kind):
         f"<b><u>☰ {m['title']} :</u></b>\n\n"
         f"➲ <b>{m['label']}</b> : {_menu_value(uid, kind, s)}\n\n"
         f"➲ <b>Description</b> : <i>{m['desc']}</i>\n\n"
-        f"{m['ask']}\n<b>Timeout:</b> <code>60 sec</code>\n"
+        f"{m['ask']}\n<b>Timeout:</b> <code>{timeout_of(kind)} sec</code>\n"
         "<i>(In groups, reply to this message.)</i>"
     )
 
@@ -379,7 +401,7 @@ def _confirm(uid, s, user):
 
 
 def _universal(uid, s, user):
-    limit = C.DAILY_TASK_LIMIT
+    limit = limits.get("daily")
     used = daily_used(uid)
     last = USERS.get(str(uid), {}).get("last_used")
     text = (
@@ -511,13 +533,13 @@ def set_direct(uid, key, value):
         return "✅ All settings were reset."
     if key in ("prefix", "suffix", "caption", "rename"):
         put(uid, key, "" if clear else value)
-    elif key == "remove":
-        put(uid, key, "" if clear else ", ".join(parse_words(value)))
-    elif key == "replace":
-        pairs = parse_pairs(value)
-        if not clear and not pairs:
-            return "❌ Use <code>old:new</code> pairs, e.g. <code>/us -s replace WEB-DL:WEBDL</code>"
-        put(uid, key, "" if clear else ", ".join(f"{a}:{b}" for a, b in pairs))
+    elif key in ("remove", "replace"):
+        if not clear:
+            try:
+                (parse_remove if key == "remove" else parse_replace)(value)
+            except ValueError as e:
+                return f"❌ {e}"
+        put(uid, key, "" if clear else value)
     elif key == "ytopts":
         if not clear:
             _, err = parse_ytopts(value)
